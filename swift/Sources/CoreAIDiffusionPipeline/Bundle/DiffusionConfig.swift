@@ -21,6 +21,10 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     public let type: PipelineType?
     public let predictionType: PredictionType?
     public let imageSize: Int?
+    /// A non-square export's width and height in pixels. When both are present they
+    /// override `imageSize`; a square export leaves them out.
+    public let imageWidth: Int?
+    public let imageHeight: Int?
 
     public let encoderScaleFactor: Float?
     public let decoderScaleFactor: Float?
@@ -60,6 +64,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         type: PipelineType? = nil,
         predictionType: PredictionType? = nil,
         imageSize: Int? = nil,
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil,
         encoderScaleFactor: Float? = nil,
         decoderScaleFactor: Float? = nil,
         decoderShiftFactor: Float? = nil,
@@ -80,6 +86,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.type = type
         self.predictionType = predictionType
         self.imageSize = imageSize
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -102,6 +110,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         case type
         case predictionType = "prediction_type"
         case imageSize = "image_size"
+        case imageWidth = "image_width"
+        case imageHeight = "image_height"
         case encoderScaleFactor = "encoder_scale_factor"
         case decoderScaleFactor = "decoder_scale_factor"
         case decoderShiftFactor = "decoder_shift_factor"
@@ -129,6 +139,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.predictionType = (try c.decodeIfPresent(String.self, forKey: .predictionType))
             .flatMap(PredictionType.init(rawValue:))
         self.imageSize = try c.decodeIfPresent(Int.self, forKey: .imageSize)
+        self.imageWidth = try c.decodeIfPresent(Int.self, forKey: .imageWidth)
+        self.imageHeight = try c.decodeIfPresent(Int.self, forKey: .imageHeight)
         self.encoderScaleFactor = try c.decodeIfPresent(Float.self, forKey: .encoderScaleFactor)
         self.decoderScaleFactor = try c.decodeIfPresent(Float.self, forKey: .decoderScaleFactor)
         self.decoderShiftFactor = try c.decodeIfPresent(Float.self, forKey: .decoderShiftFactor)

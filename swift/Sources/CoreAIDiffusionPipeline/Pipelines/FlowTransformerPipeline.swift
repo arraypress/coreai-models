@@ -57,12 +57,19 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
     public let batchNormVar: [Float]?
     public let batchNormEps: Float
 
-    /// Image size is determined by the mode selected at init.
+    /// Image size is determined by the mode selected at init, or by a non-square
+    /// export's `image_width` × `image_height`.
     public var defaultImageSize: (width: Int, height: Int) {
+        if let width = config.imageWidth, let height = config.imageHeight {
+            return mode == .half ? (width / 2, height / 2) : (width, height)
+        }
         let full = config.imageSize ?? DiffusionDefaults.Image.imageSize
         let size = (mode == .half) ? full / 2 : full
         return (size, size)
     }
+
+    /// Whether this export's image is non-square — text-to-image only.
+    public var isNonSquare: Bool { defaultImageSize.width != defaultImageSize.height }
 
     public var supportedSchedulers: [SchedulerType] {
         [.discreteFlow]
@@ -229,7 +236,8 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
         if configuration.lazyModelLoading { await decoder.unloadResources() }
 
-        let image = try DiffusionUtilities.pixelsToCGImage(pixels, height: imageSize, width: imageSize)
+        let image = try DiffusionUtilities.pixelsToCGImage(
+            pixels, height: defaultImageSize.height, width: defaultImageSize.width)
 
         var latentsND = NDArray(shape: plan.noiseShape, scalarType: .float32)
         let latentsView = latentsND.mutableView(as: Float.self)

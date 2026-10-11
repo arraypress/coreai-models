@@ -50,8 +50,9 @@ extension FlowTransformerPipeline {
         let textSeqLen = textMask.count
         let textShape = [1, textSeqLen, textEmbeddings.count / textSeqLen]
 
-        let side = defaultImageSize.width / Self.sanaSpatialCompression
-        let latentShape = [1, Self.sanaLatentChannels, side, side]
+        let rows = defaultImageSize.height / Self.sanaSpatialCompression
+        let cols = defaultImageSize.width / Self.sanaSpatialCompression
+        let latentShape = [1, Self.sanaLatentChannels, rows, cols]
         let latentCount = latentShape.reduce(1, *)
 
         // diffusers draws the initial latents and every step's renoise from one generator.

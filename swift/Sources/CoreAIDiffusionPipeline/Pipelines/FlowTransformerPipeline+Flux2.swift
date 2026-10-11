@@ -78,8 +78,11 @@ extension FlowTransformerPipeline {
         // 2. Determine latent dimensions from image size
         let imageSize = defaultImageSize.width
         let spatialSide = imageSize / Self.patchSize
+        // A non-square export traces the transformer on a rows × cols token grid.
+        let rows = defaultImageSize.height / Self.patchSize
+        let cols = defaultImageSize.width / Self.patchSize
         let inChannels = Self.latentChannels
-        let seqLen = spatialSide * spatialSide
+        let seqLen = rows * cols
 
         // 3. Setup scheduler.
         // Reference-token img2img uses the full schedule (1.0 → 0): structure comes
@@ -92,6 +95,10 @@ extension FlowTransformerPipeline {
         // half-resolution VAE encoder (traced for 512×512), but the reference is
         // encoded at the full image size — feeding it a 1024 image crashes on a
         // shape mismatch. Fail early with a clear message instead.
+        if isActuallyImg2Img && isNonSquare {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "img2img needs a square export; this one is \(defaultImageSize.width)×\(defaultImageSize.height).")
+        }
         if isActuallyImg2Img && mode == .tiled {
             throw PipelineLoadError.unsupportedConfiguration(
                 "img2img is not supported with tiled decode. Use --decode-resolution full or half.")
@@ -107,11 +114,11 @@ extension FlowTransformerPipeline {
         )
 
         // 4. Generate noise [1, inChannels, spatialSide, spatialSide]
-        let latentShape = [1, inChannels, spatialSide, spatialSide]
+        let latentShape = [1, inChannels, rows, cols]
         let latentCount = latentShape.reduce(1, *)
         let noise = generateNoise(count: latentCount, seed: configuration.seed, sourceType: .torch)
         let noisePacked = packLatentsSpatialFlatten(
-            noise, channels: inChannels, height: spatialSide, width: spatialSide)
+            noise, channels: inChannels, height: rows, width: cols)
 
         // 5. Initialize reference tokens. Latents start from pure noise either way.
         var referenceTokens: [Float]?
@@ -165,7 +172,7 @@ extension FlowTransformerPipeline {
             imageIds = buildImageIdsWithReference(
                 noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
         } else {
-            imageIds = buildImageIds(side: spatialSide, axisCount: axisCount)
+            imageIds = buildImageIds(rows: rows, cols: cols, axisCount: axisCount)
         }
         let textIds = buildTextIds(textSeqLen: textSeqLen, axisCount: axisCount)
 
@@ -302,11 +309,11 @@ extension FlowTransformerPipeline {
         // Unpack → BN denorm → unpatchify: (1, 64*64, 128) → (1, 32, 128, 128)
         let vaeLatents: (_ latents: [Float]) -> [Float] = { packed in
             let spatial = unpackLatentsSpatialFlatten(
-                packed, channels: inChannels, height: spatialSide, width: spatialSide)
+                packed, channels: inChannels, height: rows, width: cols)
             let denormed = applyBatchNormDenorm(
-                spatial, channels: inChannels, height: spatialSide, width: spatialSide)
+                spatial, channels: inChannels, height: rows, width: cols)
             return Self.unpatchifyLatents(
-                denormed, channels: inChannels, height: spatialSide, width: spatialSide)
+                denormed, channels: inChannels, height: rows, width: cols)
         }
 
         return DenoisingPlan(
@@ -315,7 +322,7 @@ extension FlowTransformerPipeline {
             renoise: nil,
             predict: predict,
             vaeLatents: vaeLatents,
-            vaeShape: [1, inChannels / 4, spatialSide * 2, spatialSide * 2],
+            vaeShape: [1, inChannels / 4, rows * 2, cols * 2],
             denoiser: denoiser,
             initialNoise: noise,
             noiseShape: latentShape)
@@ -416,11 +423,11 @@ extension FlowTransformerPipeline {
 
     /// `img_ids` for in-graph RoPE: `[1, side*side, axisCount]` flattened row-major,
     /// one row per image token as [T, H, W, L].
-    private func buildImageIds(side: Int, axisCount: Int) -> [Float] {
-        var ids = [Float](repeating: 0, count: side * side * axisCount)
-        for h in 0..<side {
-            for w in 0..<side {
-                let idx = h * side + w
+    private func buildImageIds(rows: Int, cols: Int, axisCount: Int) -> [Float] {
+        var ids = [Float](repeating: 0, count: rows * cols * axisCount)
+        for h in 0..<rows {
+            for w in 0..<cols {
+                let idx = h * cols + w
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
             }
