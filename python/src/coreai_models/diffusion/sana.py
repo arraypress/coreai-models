@@ -111,11 +111,11 @@ class SanaVAEDecoderWrapper(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _dummy_sana_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tensor, ...]:
+def _dummy_sana_transformer_impl(pipe: Any, grid_size: int, grid_w: int | None = None) -> tuple[torch.Tensor, ...]:
     cfg = pipe.transformer.config
     dtype = next(pipe.transformer.parameters()).dtype
     return (
-        torch.randn(1, cfg.in_channels, grid_size, grid_size, dtype=dtype),
+        torch.randn(1, cfg.in_channels, grid_size, grid_w or grid_size, dtype=dtype),
         torch.randn(1, TEXT_SEQUENCE_LENGTH, cfg.caption_channels, dtype=dtype),
         torch.ones(1, TEXT_SEQUENCE_LENGTH, dtype=dtype),
         torch.tensor([0.5], dtype=dtype),
@@ -124,7 +124,12 @@ def _dummy_sana_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tenso
 
 
 def dummy_sana_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
-    """1024×1024: 32×32 latent grid (1024 tokens)."""
+    """1024×1024: 32×32 latent grid (1024 tokens), or the COREAI_IMAGE_HW shape (pixels / 32)."""
+    from coreai_models.diffusion.flux2 import export_image_size
+    size = export_image_size()
+    if size is not None:
+        assert size[0] % 32 == 0 and size[1] % 32 == 0, "SANA's DC-AE needs multiples of 32"
+        return _dummy_sana_transformer_impl(pipe, grid_size=size[0] // 32, grid_w=size[1] // 32)
     return _dummy_sana_transformer_impl(pipe, grid_size=pipe.transformer.config.sample_size)
 
 
@@ -146,7 +151,11 @@ def dummy_sana_text_encoder_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
 
 
 def dummy_sana_vae_decoder(pipe: Any) -> tuple[torch.Tensor, ...]:
+    from coreai_models.diffusion.flux2 import export_image_size
     cfg = pipe.vae.config
     dtype = next(pipe.vae.parameters()).dtype
+    shape = export_image_size()
+    if shape is not None:  # pixels / 32
+        return (torch.randn(1, cfg.latent_channels, shape[0] // 32, shape[1] // 32, dtype=dtype),)
     size = pipe.transformer.config.sample_size
     return (torch.randn(1, cfg.latent_channels, size, size, dtype=dtype),)

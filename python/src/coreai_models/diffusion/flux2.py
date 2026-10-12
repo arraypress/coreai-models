@@ -130,6 +130,29 @@ class Flux2VAEEncoderWrapper(torch.nn.Module):
 REFERENCE_TOKEN_TIME_OFFSET = 10.0
 
 
+def export_image_size() -> tuple[int, int] | None:
+    """`COREAI_IMAGE_HW=HEIGHTxWIDTH` (pixels): export one non-square shape instead of the
+    square default. The runtime reads the matching `image_width` / `image_height` from the
+    folder metadata (FlowTransformerPipeline). Unset = the upstream square behaviour."""
+    import os
+    value = os.environ.get("COREAI_IMAGE_HW")
+    if not value:
+        return None
+    height, width = (int(part) for part in value.lower().split("x"))
+    return height, width
+
+
+def _rect_position_ids(grid_h: int, grid_w: int, num_axes: int, time_offset: float = 0.0) -> torch.Tensor:
+    """`[grid_h*grid_w, num_axes]` position IDs as [T, H, W, L], row-major over H then W."""
+    grid_hh, grid_ww = torch.meshgrid(torch.arange(grid_h, dtype=torch.float32),
+                                      torch.arange(grid_w, dtype=torch.float32), indexing="ij")
+    ids = torch.zeros(grid_h * grid_w, num_axes)
+    ids[:, 0] = time_offset
+    ids[:, 1] = grid_hh.reshape(-1)
+    ids[:, 2] = grid_ww.reshape(-1)
+    return ids
+
+
 def _grid_position_ids(side: int, num_axes: int, time_offset: float = 0.0) -> torch.Tensor:
     """`[side*side, num_axes]` position IDs as [T, H, W, L], row-major over H then W."""
     coords = torch.arange(side, dtype=torch.float32)
@@ -172,8 +195,25 @@ def _dummy_flux2_transformer_impl(pipe: Any, grid_size: int) -> tuple[torch.Tens
 
 
 def dummy_flux2_transformer(pipe: Any) -> tuple[torch.Tensor, ...]:
-    """1024×1024 (grid=64, seqLen=4096)."""
-    return _dummy_flux2_transformer_impl(pipe, grid_size=64)
+    """1024×1024 (grid=64, seqLen=4096), or the COREAI_IMAGE_HW shape (grid = pixels / 16)."""
+    size = export_image_size()
+    if size is None:
+        return _dummy_flux2_transformer_impl(pipe, grid_size=64)
+    height, width = size
+    assert height % 16 == 0 and width % 16 == 0, "FLUX.2 needs multiples of 16"
+    grid_h, grid_w = height // 16, width // 16
+    cfg = pipe.transformer.config
+    dtype = next(pipe.transformer.parameters()).dtype
+    text_seq_len = 512
+    num_rope_axes = len(list(cfg.axes_dims_rope))
+    return (
+        torch.randn(1, grid_h * grid_w, cfg.in_channels, dtype=dtype),
+        torch.randn(1, text_seq_len, cfg.joint_attention_dim, dtype=dtype),
+        torch.tensor([0.5], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+        _rect_position_ids(grid_h, grid_w, num_rope_axes).unsqueeze(0),
+        _text_position_ids(text_seq_len, num_rope_axes),
+    )
 
 
 def dummy_flux2_transformer_quant_trace(pipe: Any) -> tuple[torch.Tensor, ...]:
@@ -195,8 +235,11 @@ def dummy_flux2_text_encoder(pipe: Any) -> tuple[torch.Tensor, ...]:
 
 def dummy_flux2_vae_decoder(pipe: Any) -> tuple[torch.Tensor, ...]:
     latent_channels = pipe.vae.config.latent_channels
-    sample_size = 128  # 1024 / 8
     dtype = next(pipe.vae.parameters()).dtype
+    size = export_image_size()
+    if size is not None:  # pixels / 8
+        return (torch.randn(1, latent_channels, size[0] // 8, size[1] // 8, dtype=dtype),)
+    sample_size = 128  # 1024 / 8
     return (torch.randn(1, latent_channels, sample_size, sample_size, dtype=dtype),)
 
 
