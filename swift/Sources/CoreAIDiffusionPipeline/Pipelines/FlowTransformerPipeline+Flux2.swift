@@ -25,6 +25,8 @@ extension FlowTransformerPipeline {
     /// Reference tokens sit at T=10 on RoPE axis 0, separating them from the noise
     /// grid (T=0) where H/W would otherwise collide. Matches the export-time dummies.
     private static let referenceTokenTimeOffset: Float = 10
+    /// The full-grid route holds four quarter-grid references.
+    static let maxReferenceImages = 4
 
     /// FLUX.2 flow-matching timestep shift.
     ///
@@ -89,7 +91,7 @@ extension FlowTransformerPipeline {
         // from the concatenated reference tokens, not from noise blending. txt2img
         // also uses [1.0 → 0]. So sigmaMax is 1.0 in both cases.
         let mu = Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: steps)
-        let isActuallyImg2Img = configuration.isImageToImage && encoder != nil && configuration.startingImage != nil
+        let isActuallyImg2Img = configuration.isImageToImage && encoder != nil
 
         // Reference-token img2img is incompatible with tiled decode: tiled uses the
         // half-resolution VAE encoder (traced for 512×512), but the reference is
@@ -124,9 +126,37 @@ extension FlowTransformerPipeline {
         var referenceTokens: [Float]?
         var refSide: Int = 0
 
-        if isActuallyImg2Img,
+        let references = configuration.referenceImages
+        var referenceSlots: [Int] = []
+        if isActuallyImg2Img, let enc = encoder, references.count > 1 {
+            // Several references share the traced full-grid route: each is averaged to
+            // a quarter grid and the four quarters are dealt out in turn, so two
+            // references get two quarters each (identical keys, equal weight) and the
+            // first of three gets two.
+            guard references.count <= Self.maxReferenceImages else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "FLUX.2 takes at most \(Self.maxReferenceImages) reference images; got \(references.count).")
+            }
+            guard configuration.referenceGrid == .full else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "several reference images need the full reference grid.")
+            }
+            refSide = spatialSide
+            let quarterSide = spatialSide / 2
+            var quarters: [[Float]] = []
+            for image in references {
+                let full = try await encodeReferenceImage(
+                    encoder: enc, srcImage: image, imageSize: imageSize,
+                    spatialSide: spatialSide, inChannels: inChannels)
+                quarters.append(Self.subsampleTokens(
+                    full, fromSide: spatialSide, toSide: quarterSide, channels: inChannels))
+            }
+            referenceSlots = Self.referenceSlots(count: references.count)
+            referenceTokens = referenceSlots.flatMap { quarters[$0] }
+            if configuration.lazyModelLoading { await enc.unloadResources() }
+        } else if isActuallyImg2Img,
             let enc = encoder,
-            let srcImage = configuration.startingImage
+            let srcImage = references.first
         {
             // Reference grid size based on the requested reference grid
             switch configuration.referenceGrid {
@@ -168,7 +198,11 @@ extension FlowTransformerPipeline {
         // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
         // so the transformer's in-graph RoPE separates them from the noise grid.
         let imageIds: [Float]
-        if referenceTokens != nil {
+        if !referenceSlots.isEmpty {
+            imageIds = Self.buildImageIdsWithReferences(
+                noiseSide: spatialSide, slots: referenceSlots, slotSide: spatialSide / 2,
+                axisCount: axisCount)
+        } else if referenceTokens != nil {
             imageIds = buildImageIdsWithReference(
                 noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
         } else {
@@ -462,6 +496,40 @@ extension FlowTransformerPipeline {
             }
         }
 
+        return ids
+    }
+
+    /// Which reference fills each of the four quarter slots: dealt in turn.
+    static func referenceSlots(count: Int) -> [Int] {
+        (0..<maxReferenceImages).map { $0 % count }
+    }
+
+    /// `img_ids` for several references: noise tokens, then one quarter grid per slot.
+    /// Reference `r` carries T = 10 + 10·r on axis 0 (diffusers' `scale + scale * i`),
+    /// so slots holding the same reference share ids and separate references stay apart.
+    static func buildImageIdsWithReferences(
+        noiseSide: Int, slots: [Int], slotSide: Int, axisCount: Int
+    ) -> [Float] {
+        let noiseSeq = noiseSide * noiseSide
+        let slotSeq = slotSide * slotSide
+        var ids = [Float](repeating: 0, count: (noiseSeq + slots.count * slotSeq) * axisCount)
+        for h in 0..<noiseSide {
+            for w in 0..<noiseSide {
+                let idx = h * noiseSide + w
+                ids[idx * axisCount + 1] = Float(h)
+                ids[idx * axisCount + 2] = Float(w)
+            }
+        }
+        for (slot, reference) in slots.enumerated() {
+            for h in 0..<slotSide {
+                for w in 0..<slotSide {
+                    let idx = noiseSeq + slot * slotSeq + h * slotSide + w
+                    ids[idx * axisCount + 0] = referenceTokenTimeOffset * Float(reference + 1)
+                    ids[idx * axisCount + 1] = Float(h)
+                    ids[idx * axisCount + 2] = Float(w)
+                }
+            }
+        }
         return ids
     }
 

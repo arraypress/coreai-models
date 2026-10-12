@@ -69,6 +69,11 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var strength: Float
     public var referenceGrid: ReferenceGrid
     public var guidanceMode: GuidanceMode
+    /// Further reference images after `startingImage` (FLUX.2 only). With more than one
+    /// reference in all, each is area-averaged to a quarter of the tokens and the four
+    /// quarters of the traced full-grid route are dealt to them in turn, each reference
+    /// on its own T offset (10, 20, …) as diffusers does. Up to four references in all.
+    public var additionalReferences: [CGImage]
 
     // VAE scale factors (from the metadata.json diffusion block)
     public var encoderScaleFactor: Float
@@ -97,7 +102,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
         decodeResolution: DecodeResolution = .full,
-        lazyModelLoading: Bool = true
+        lazyModelLoading: Bool = true,
+        additionalReferences: [CGImage] = []
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -114,9 +120,13 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.decoderShiftFactor = decoderShiftFactor
         self.decodeResolution = decodeResolution
         self.lazyModelLoading = lazyModelLoading
+        self.additionalReferences = additionalReferences
     }
 
-    public var isImageToImage: Bool { startingImage != nil }
+    public var isImageToImage: Bool { startingImage != nil || !additionalReferences.isEmpty }
+
+    /// Every reference image, the starting image first.
+    public var referenceImages: [CGImage] { (startingImage.map { [$0] } ?? []) + additionalReferences }
 }
 
 /// Hashable conformance — CGImage excluded (not Hashable).
@@ -136,6 +146,7 @@ extension PipelineConfiguration {
         hasher.combine(decoderShiftFactor)
         hasher.combine(decodeResolution)
         hasher.combine(lazyModelLoading)
+        hasher.combine(additionalReferences.count)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -153,5 +164,6 @@ extension PipelineConfiguration {
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
             && lhs.decodeResolution == rhs.decodeResolution
             && lhs.lazyModelLoading == rhs.lazyModelLoading
+            && lhs.additionalReferences.count == rhs.additionalReferences.count
     }
 }

@@ -126,3 +126,32 @@ struct Flux2TokenMathTests {
         #expect(destination == Array(full[0..<half]))
     }
 }
+
+@Suite("Flux2 multi-reference ids")
+struct Flux2MultiReferenceTests {
+    @Test("four quarter slots are dealt to the references in turn")
+    func slotsAreDealt() {
+        #expect(FlowTransformerPipeline.referenceSlots(count: 2) == [0, 1, 0, 1])
+        #expect(FlowTransformerPipeline.referenceSlots(count: 3) == [0, 1, 2, 0])
+        #expect(FlowTransformerPipeline.referenceSlots(count: 4) == [0, 1, 2, 3])
+    }
+
+    /// The ids fill the traced full-grid length exactly, and each reference keeps its own T.
+    @Test("multi-reference ids fill the full grid with one T per reference")
+    func idsCarryOneTPerReference() {
+        let axes = 4
+        let noiseSide = 8
+        let slotSide = 4
+        let ids = FlowTransformerPipeline.buildImageIdsWithReferences(
+            noiseSide: noiseSide, slots: [0, 1, 0, 1], slotSide: slotSide, axisCount: axes)
+        #expect(ids.count == 2 * noiseSide * noiseSide * axes)
+        let noiseSeq = noiseSide * noiseSide
+        let slotSeq = slotSide * slotSide
+        let firstT = (0..<4).map { ids[(noiseSeq + $0 * slotSeq) * axes] }
+        #expect(firstT == [10, 20, 10, 20])
+        #expect(ids[0] == 0)
+        let lastCorner = (noiseSeq + 3 * slotSeq + slotSeq - 1) * axes
+        #expect(ids[lastCorner + 1] == Float(slotSide - 1))
+        #expect(ids[lastCorner + 2] == Float(slotSide - 1))
+    }
+}

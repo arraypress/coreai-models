@@ -37,7 +37,7 @@ extension FlowTransformerPipeline {
     }
 
     func makeSanaSprintPlan(_ configuration: PipelineConfiguration) async throws -> DenoisingPlan {
-        if configuration.isImageToImage && configuration.startingImage != nil {
+        if configuration.isImageToImage {
             throw PipelineLoadError.unsupportedConfiguration("Sana Sprint supports text-to-image only.")
         }
         if configuration.guidanceMode == .manual {
