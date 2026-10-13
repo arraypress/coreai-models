@@ -64,8 +64,12 @@ flags are irrelevant and will produce a warning if passed without `--single-func
 ### Image-to-image
 
 Needs a VAE encoder plus an img2img transformer. Reference tokens from your input image
-are concatenated onto the noise sequence, so adherence comes from `--reference-grid`,
-not from noise blending (`--strength` is ignored).
+are concatenated onto the noise sequence, so at `--strength 1` adherence comes from
+`--reference-grid` alone. (arraypress fork, `1.0.0-nonsquare.4`:) below 1 the latents also start
+from the input image blended with noise, entering a re-spaced schedule of `steps / strength` steps
+at `total − steps`, so the caller's step count still runs and every strength is reachable. Measured
+on FLUX.2 Klein 4B at 4 steps, SSIM to the source: 0.99 at 0.2, 0.84–0.99 at 0.6, 0.64–0.67 at 0.8,
+0.49–0.56 at 1.0. Strength 1 is byte-identical to the unmodified pipeline.
 
 The default already includes every grid. `--single-function` needs one chosen at export:
 

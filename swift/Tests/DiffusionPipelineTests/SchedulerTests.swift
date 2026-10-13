@@ -355,3 +355,39 @@ struct SchedulerTests {
         }
     }
 }
+
+@Suite("Strength img2img schedule")
+struct Img2ImgScheduleTests {
+    @Test("Strength 1 keeps the full schedule")
+    func fullStrength() {
+        #expect(DiscreteFlowScheduler.img2imgSchedule(steps: 4, strength: 1) == nil)
+        #expect(DiscreteFlowScheduler.img2imgSchedule(steps: 4, strength: 1.5) == nil)
+    }
+
+    @Test("Below 1 the caller's step count still runs")
+    func keepsStepCount() {
+        for strength: Float in [0.05, 0.2, 0.4, 0.6, 0.8, 0.99] {
+            let plan = DiscreteFlowScheduler.img2imgSchedule(steps: 4, strength: strength)!
+            #expect(plan.total - plan.begin == 4)
+            #expect(plan.begin >= 1)
+        }
+    }
+
+    @Test("Lower strength enters lower on the noise schedule")
+    func monotonic() {
+        var previous: Float = 2
+        for strength: Float in [0.9, 0.7, 0.5, 0.3, 0.1] {
+            let plan = DiscreteFlowScheduler.img2imgSchedule(steps: 4, strength: strength)!
+            let scheduler = DiscreteFlowScheduler(stepCount: plan.total, mu: 2.0)
+            scheduler.setBeginIndex(plan.begin)
+            #expect(scheduler.currentSigma < previous)
+            previous = scheduler.currentSigma
+        }
+    }
+
+    @Test("addNoise blends toward noise by sigma")
+    func blend() {
+        let scheduler = DiscreteFlowScheduler(stepCount: 4)
+        #expect(scheduler.addNoise(to: [2, 4], noise: [0, 0], at: 0.25) == [1.5, 3])
+    }
+}

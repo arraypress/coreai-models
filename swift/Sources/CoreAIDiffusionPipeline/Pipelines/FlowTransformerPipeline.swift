@@ -166,8 +166,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
             : try await makeFlux2Plan(configuration)
         let scheduler = plan.scheduler
         let steps = scheduler.inferenceStepCount
+        // Strength img2img enters the schedule part-way; progress counts the steps that run.
+        let begin = scheduler.beginIndex
 
-        for step in 0..<steps {
+        for step in begin..<steps {
             // Capture the denoising state BEFORE the scheduler advances so the
             // preview below can form the x0 estimate.
             let sigma = scheduler.currentSigma
@@ -203,7 +205,8 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
                 previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
                     for i in 0..<vae.count { ptr[i] = vae[i] }
                 }
-                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
+                let progress = PipelineProgress(
+                    step: step - begin + 1, totalSteps: steps - begin, currentLatent: previewLatents)
                 if !progressHandler(progress) { break }
             }
         }

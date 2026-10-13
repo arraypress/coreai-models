@@ -106,14 +106,20 @@ extension FlowTransformerPipeline {
                 "img2img is not supported with tiled decode. Use --decode-resolution full or half.")
         }
 
+        // Strength below 1 starts part-way down a re-spaced schedule from the source
+        // picture blended with noise (see `DiscreteFlowScheduler.img2imgSchedule`); at 1
+        // nothing here changes, so full-strength edits stay byte-identical.
+        let partial = isActuallyImg2Img
+            ? DiscreteFlowScheduler.img2imgSchedule(steps: steps, strength: configuration.strength) : nil
         let sigmaMax: Float = 1.0
         let scheduler = DiscreteFlowScheduler(
-            stepCount: steps,
+            stepCount: partial?.total ?? steps,
             trainStepCount: 1000,
             timeStepShift: 1.0,
-            mu: mu,
+            mu: partial.map { Self.computeEmpiricalMu(imageSeqLen: seqLen, numSteps: $0.total) } ?? mu,
             sigmaMax: sigmaMax
         )
+        if let partial { scheduler.setBeginIndex(partial.begin) }
 
         // 4. Generate noise [1, inChannels, spatialSide, spatialSide]
         let latentShape = [1, inChannels, rows, cols]
@@ -122,9 +128,12 @@ extension FlowTransformerPipeline {
         let noisePacked = packLatentsSpatialFlatten(
             noise, channels: inChannels, height: rows, width: cols)
 
-        // 5. Initialize reference tokens. Latents start from pure noise either way.
+        // 5. Initialize reference tokens. Latents start from pure noise at strength 1,
+        // and from the first reference blended with noise below it.
         var referenceTokens: [Float]?
         var refSide: Int = 0
+        /// The first reference at full grid: what a strength below 1 starts from.
+        var sourceLatents: [Float]?
 
         let references = configuration.referenceImages
         var referenceSlots: [Int] = []
@@ -148,6 +157,7 @@ extension FlowTransformerPipeline {
                 let full = try await encodeReferenceImage(
                     encoder: enc, srcImage: image, imageSize: imageSize,
                     spatialSide: spatialSide, inChannels: inChannels)
+                if sourceLatents == nil { sourceLatents = full }
                 quarters.append(Self.subsampleTokens(
                     full, fromSide: spatialSide, toSide: quarterSide, channels: inChannels))
             }
@@ -170,6 +180,7 @@ extension FlowTransformerPipeline {
                 encoder: enc, srcImage: srcImage, imageSize: imageSize,
                 spatialSide: spatialSide, inChannels: inChannels
             )
+            sourceLatents = fullRefPacked
             let refPacked: [Float]
             if refSide == spatialSide {
                 refPacked = fullRefPacked
@@ -180,10 +191,11 @@ extension FlowTransformerPipeline {
             referenceTokens = refPacked
             if configuration.lazyModelLoading { await enc.unloadResources() }
 
-            // FLUX.2 reference-token img2img: noise latents start from PURE NOISE.
-            // The reference tokens concatenated at each step provide structural
-            // guidance via cross-attention. The text prompt steers content.
-            // (This differs from SD-style img2img which blends noise with the encoded image.)
+            // FLUX.2 reference-token img2img: at strength 1 the latents start from PURE
+            // NOISE and the reference tokens concatenated at each step provide structural
+            // guidance via cross-attention, while the text prompt steers content. Below 1
+            // the latents ALSO start from this picture blended with noise (SD-style), so
+            // strength bounds how far the result can wander from it.
         }
 
         // 6. Build RoPE position IDs — the transformer computes the frequencies in-graph
@@ -350,8 +362,14 @@ extension FlowTransformerPipeline {
                 denormed, channels: inChannels, height: rows, width: cols)
         }
 
+        // x_t = (1 − σ)·x0 + σ·ε at the entry sigma, as diffusers' `scale_noise`.
+        var startLatents = noisePacked
+        if partial != nil, let x0 = sourceLatents {
+            startLatents = scheduler.addNoise(to: x0, noise: noisePacked, at: scheduler.currentSigma)
+        }
+
         return DenoisingPlan(
-            latents: noisePacked,
+            latents: startLatents,
             scheduler: scheduler,
             renoise: nil,
             predict: predict,
