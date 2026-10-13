@@ -277,6 +277,10 @@ extension FlowTransformerPipeline {
         // seqLen*inChannels array on every one.
         var cfgBuffer = [Float](repeating: 0, count: seqLen * inChannels)
 
+        // A `--lora-slot` export's LoRA matrices; the function ignores names it does not
+        // declare, so the img2img routes take the same dictionary harmlessly.
+        let slotInputs = configuration.transformerInputs
+
         let predict: (_ latents: [Float], _ step: Int, _ sigma: Float) async throws -> [Float] = {
             packedLatents, step, _ in
             let timestepValue = Float(scheduler.timeSteps[step]) / 1000.0
@@ -307,7 +311,7 @@ extension FlowTransformerPipeline {
                         ([Float(0)], [1]),
                         (imageIds, [1, inputSeqLen, axisCount]),
                         (textIds, [1, textSeqLen, axisCount]),
-                    ], functionName: fnName)
+                    ], functionName: fnName, namedInputs: slotInputs)
 
                 let uncondOutput = try await denoiser.run(
                     floatInputs: [
@@ -317,7 +321,7 @@ extension FlowTransformerPipeline {
                         ([Float(0)], [1]),
                         (imageIds, [1, inputSeqLen, axisCount]),
                         (textIds, [1, textSeqLen, axisCount]),
-                    ], functionName: fnName)
+                    ], functionName: fnName, namedInputs: slotInputs)
 
                 let condSlice: ArraySlice<Float>
                 let uncondSlice: ArraySlice<Float>
@@ -344,7 +348,7 @@ extension FlowTransformerPipeline {
                     ([guidanceScale], [1]),
                     (imageIds, [1, inputSeqLen, axisCount]),
                     (textIds, [1, textSeqLen, axisCount]),
-                ], functionName: fnName)
+                ], functionName: fnName, namedInputs: slotInputs)
 
             if referenceTokens != nil {
                 return Array(fullOutput[0..<(seqLen * inChannels)])

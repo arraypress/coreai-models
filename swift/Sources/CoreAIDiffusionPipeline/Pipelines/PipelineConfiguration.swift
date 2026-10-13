@@ -75,6 +75,11 @@ public struct PipelineConfiguration: Hashable, Sendable {
     /// on its own T offset (10, 20, …) as diffusers does. Up to four references in all.
     public var additionalReferences: [CGImage]
 
+    /// Extra named inputs for the text-to-image transformer — the LoRA matrices of an
+    /// export made with `--lora-slot` (see ``LoRASlot``). Ignored by functions that do not
+    /// declare them; slot inputs left out are zeros.
+    public var transformerInputs: [String: NDArray]
+
     // VAE scale factors (from the metadata.json diffusion block)
     public var encoderScaleFactor: Float
     public var decoderScaleFactor: Float
@@ -103,7 +108,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         decoderShiftFactor: Float = 0.0,
         decodeResolution: DecodeResolution = .full,
         lazyModelLoading: Bool = true,
-        additionalReferences: [CGImage] = []
+        additionalReferences: [CGImage] = [],
+        transformerInputs: [String: NDArray] = [:]
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -121,6 +127,7 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.decodeResolution = decodeResolution
         self.lazyModelLoading = lazyModelLoading
         self.additionalReferences = additionalReferences
+        self.transformerInputs = transformerInputs
     }
 
     public var isImageToImage: Bool { startingImage != nil || !additionalReferences.isEmpty }
@@ -147,6 +154,7 @@ extension PipelineConfiguration {
         hasher.combine(decodeResolution)
         hasher.combine(lazyModelLoading)
         hasher.combine(additionalReferences.count)
+        hasher.combine(transformerInputs.keys.sorted())
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -165,5 +173,6 @@ extension PipelineConfiguration {
             && lhs.decodeResolution == rhs.decodeResolution
             && lhs.lazyModelLoading == rhs.lazyModelLoading
             && lhs.additionalReferences.count == rhs.additionalReferences.count
+            && lhs.transformerInputs.keys.sorted() == rhs.transformerInputs.keys.sorted()
     }
 }
