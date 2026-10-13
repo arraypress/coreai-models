@@ -48,11 +48,14 @@ extension FlowTransformerPipeline {
         let transformerFnName: String
         switch resolvedMode {
         case .full, .tiled:
-            guard let path = Self.resolveAsset(at: url, name: AssetName.transformer) else {
+            // The metadata's own path first: a shape folder of a multi-shape export names
+            // a transformer outside it (`../../TransformerShapes.aimodel`).
+            guard let path = Self.listedAsset(bundle.transformerFilename, at: url)
+                ?? Self.resolveAsset(at: url, name: AssetName.transformer) else {
                 throw PipelineLoadError.missingComponent(AssetName.transformer)
             }
             transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
-            transformerFnName = "main"
+            transformerFnName = config.transformerFunction ?? "main"
         case .half:
             if let path = Self.resolveAsset(at: url, name: AssetName.transformer) {
                 let candidate = CoreAIDiffusionModelFunction(
@@ -86,7 +89,7 @@ extension FlowTransformerPipeline {
         // Resolve how each reference grid reaches a traced graph.
         //
         // Prefer the multi-function transformer when available.
-        let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : "img2img_"
+        let entrypointPrefix = resolvedMode == .half ? "img2img_512_" : (config.img2imgFunctionPrefix ?? "img2img_")
         let assetPrefix = resolvedMode == .half ? "Transformer_512_img2img" : "Transformer_img2img"
         var img2imgRoutes: [ReferenceGrid: Img2ImgRoute] = [:]
         for grid in ReferenceGrid.allCases {
@@ -107,7 +110,8 @@ extension FlowTransformerPipeline {
         let decoderName: String
         switch resolvedMode {
         case .full:
-            guard let path = Self.resolveAsset(at: url, name: AssetName.vaeDecoder) else {
+            guard let path = Self.listedAsset(bundle.vaeDecoderFilename, at: url)
+                ?? Self.resolveAsset(at: url, name: AssetName.vaeDecoder) else {
                 throw PipelineLoadError.missingComponent(AssetName.vaeDecoder)
             }
             decoderName = path
@@ -209,6 +213,14 @@ extension FlowTransformerPipeline {
     }
 
     /// Resolve an asset name to a filename, checking for .aimodel.
+    /// A path `metadata.json` lists, when it exists — relative paths may leave the folder.
+    private static func listedAsset(_ listed: String?, at url: URL) -> String? {
+        guard let listed, FileManager.default.fileExists(atPath: url.appendingPathComponent(listed).path) else {
+            return nil
+        }
+        return listed
+    }
+
     private static func resolveAsset(at url: URL, name: String) -> String? {
         let candidate = url.appendingPathComponent("\(name).aimodel")
         guard FileManager.default.fileExists(atPath: candidate.path) else { return nil }

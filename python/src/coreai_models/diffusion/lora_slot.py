@@ -168,3 +168,162 @@ def export_lora_slot(
     (out / "slot.json").write_text(json.dumps(wrapper.layout(rank), indent=1))
     logger.info(f"LoRA-slot transformer exported in {time.time() - started:.0f}s: {asset}")
     return asset
+
+
+# ---------------------------------------------------------------------------
+# Several shapes in one asset
+# ---------------------------------------------------------------------------
+
+
+def shape_function_names(height: int, width: int) -> tuple[str, str]:
+    """The text-to-image and full-grid img2img entrypoints for one shape.
+
+    1024×1024 keeps the names Apple's pipeline enters by default (``main``,
+    ``img2img_full``); any other shape is named by its pixels, height first, so a
+    folder's ``metadata.json`` can point the pipeline at it (``transformer_function``,
+    ``img2img_function_prefix``).
+    """
+    if (height, width) == (1024, 1024):
+        return "main", "img2img_full"
+    return f"t2i_{height}x{width}", f"img2img_{height}x{width}_full"
+
+
+def _rewrap(wrapper: SlotTransformer) -> None:
+    """Fresh :class:`SlotLinear` modules over the same base weights, with a fresh context.
+
+    A second ``torch.export`` through the first trace's slot modules lifts that trace's
+    fake tensors as constants (".numpy() is not supported for tensor subclasses" at
+    conversion). New wrappers per trace avoid it; the base ``Linear`` weights are the same
+    objects, so the asset still holds one copy.
+    """
+    ctx: list[Any] = [None] * len(wrapper.ctx)
+    wrapper.ctx = ctx
+    for i, (name, _, _) in enumerate(wrapper.layers):
+        parent_name, _, attr = name.rpartition(".")
+        parent = wrapper.model.get_submodule(parent_name) if parent_name else wrapper.model
+        setattr(parent, attr, SlotLinear(getattr(parent, attr).base, ctx, i))
+
+
+def export_lora_slot_shapes(
+    hf_model_id: str,
+    output_dir: str | Path,
+    rank: int,
+    shapes: list[tuple[int, int]],
+    compute_precision: str = "float16",
+) -> Path:
+    """One transformer asset holding every shape, text-to-image AND img2img, each with the slot.
+
+    For each ``(height, width)`` this traces a text-to-image function and a full-grid
+    img2img function (noise tokens plus one reference grid the same size, marked by the
+    reference time offset), named by :func:`shape_function_names`. All share one copy of
+    the weights: measured on Klein 4B, two shapes made a 7.2 GB asset, the size of one,
+    and the 1:1 function's output was bit-identical to the single-shape slot export.
+
+    Trap, measured: Core AI compiles each function on first use and its cache keeps the
+    compiled weights PER FUNCTION (≈7 GB each for Klein 4B), so the download is shared but
+    the compiled cache grows with every shape a caller actually uses.
+
+    Writes ``TransformerShapes.aimodel`` and ``slot.json`` (which also lists the
+    functions and marks img2img as slotted) into ``output_dir``.
+    """
+    from diffusers import Flux2Transformer2DModel
+
+    import coreai_torch
+
+    from coreai_models.diffusion.flux2 import (
+        REFERENCE_TOKEN_TIME_OFFSET,
+        _rect_position_ids,
+        _text_position_ids,
+    )
+    from coreai_models.diffusion.gpu import _decomp_empty_permuted
+    from coreai_models.export.metadata import build_aimodel_metadata
+
+    if rank < 1:
+        raise ValueError(f"--lora-slot rank must be at least 1, got {rank}")
+    for height, width in shapes:
+        if height % 32 or width % 32:
+            raise ValueError(f"{height}x{width}: both sides must be multiples of 32 (several references "
+                             "share the grid in quarters)")
+    dtype = getattr(torch, compute_precision)
+    started = time.time()
+    transformer = Flux2Transformer2DModel.from_pretrained(hf_model_id, subfolder="transformer", torch_dtype=dtype)
+    wrapper = SlotTransformer(transformer)
+    cfg = transformer.config
+    axes = len(list(cfg.axes_dims_rope))
+    text_len = 512
+    generator = torch.Generator().manual_seed(0)
+    lora: list[torch.Tensor] = []
+    for _, fan_in, fan_out in wrapper.layers:
+        lora.append((torch.randn(rank, fan_in, generator=generator) * 1e-3).to(dtype))
+        lora.append((torch.randn(fan_out, rank, generator=generator) * 1e-3).to(dtype))
+
+    def inputs(rows: int, cols: int, reference: bool) -> tuple[torch.Tensor, ...]:
+        ids = _rect_position_ids(rows, cols, axes)
+        if reference:
+            ids = torch.cat([ids, _rect_position_ids(rows, cols, axes, time_offset=REFERENCE_TOKEN_TIME_OFFSET)])
+        return (
+            torch.randn(1, ids.shape[0], cfg.in_channels, dtype=dtype),
+            torch.randn(1, text_len, cfg.joint_attention_dim, dtype=dtype),
+            torch.tensor([0.5], dtype=dtype),
+            torch.tensor([1.0], dtype=dtype),
+            ids.unsqueeze(0),
+            _text_position_ids(text_len, axes),
+        ) + tuple(t.clone() for t in lora)
+
+    input_names = (
+        "hidden_states", "encoder_hidden_states", "timestep", "guidance", "img_ids", "txt_ids",
+        *slot_input_names(len(wrapper.layers)),
+    )
+    converter = coreai_torch.TorchConverter(mode=coreai_torch.TorchConverter.Mode.RELEASE)
+    table = coreai_torch.get_decomp_table()
+    table[torch.ops.aten.empty_permuted.default] = _decomp_empty_permuted
+    functions: list[str] = []
+    for height, width in shapes:
+        for name, reference in zip(shape_function_names(height, width), (False, True)):
+            _rewrap(wrapper)
+            wrapper.eval()
+            with torch.no_grad():
+                exported = torch.export.export(wrapper, args=inputs(height // 16, width // 16, reference))
+            converter.add_exported_program(
+                exported.run_decompositions(table), input_names=input_names,
+                output_names=("output",), entrypoint_name=name)
+            functions.append(name)
+            logger.info(f"traced {name} ({time.time() - started:.0f}s)")
+    _rewrap(wrapper)
+    program = converter.to_coreai()
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    asset = out / "TransformerShapes.aimodel"
+    program.save_asset(asset, build_aimodel_metadata(hf_model_id, component="Transformer"))
+    layout = wrapper.layout(rank) | {"img2img": True, "functions": functions}
+    (out / "slot.json").write_text(json.dumps(layout, indent=1))
+    logger.info(f"{len(functions)}-function LoRA-slot transformer exported in {time.time() - started:.0f}s: {asset}")
+    return asset
+
+
+def export_vae_shape(hf_model_id: str, output_dir: str | Path, height: int, width: int,
+                     compute_precision: str = "float16", decoder: bool = True, encoder: bool = True) -> None:
+    """The FLUX.2 VAE decoder and/or encoder traced at one ``height`` × ``width``.
+
+    Each shape folder needs its own: Core AI traces them at fixed sizes. Small (≈95 and
+    66 MB for Klein 4B), so one per shape costs little.
+    """
+    from diffusers import AutoencoderKLFlux2
+
+    from coreai_models.diffusion.flux2 import Flux2VAEDecoderWrapper, Flux2VAEEncoderWrapper
+    from coreai_models.diffusion.gpu import export_stateless
+    from coreai_models.export.metadata import build_aimodel_metadata
+
+    dtype = getattr(torch, compute_precision)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    if decoder:
+        vae = AutoencoderKLFlux2.from_pretrained(hf_model_id, subfolder="vae", torch_dtype=dtype)
+        latent = torch.randn(1, vae.config.latent_channels, height // 8, width // 8, dtype=dtype)
+        program = export_stateless(Flux2VAEDecoderWrapper(vae), (latent,), ("z",), ("image",))
+        program.save_asset(out / "VAEDecoder.aimodel", build_aimodel_metadata(hf_model_id, component="VAEDecoder"))
+    if encoder:
+        vae = AutoencoderKLFlux2.from_pretrained(hf_model_id, subfolder="vae", torch_dtype=dtype)
+        image = torch.randn(1, 3, height, width, dtype=dtype)
+        program = export_stateless(Flux2VAEEncoderWrapper(vae), (image,), ("image",), ("latent_params",))
+        program.save_asset(out / "VAEEncoder.aimodel", build_aimodel_metadata(hf_model_id, component="VAEEncoder"))

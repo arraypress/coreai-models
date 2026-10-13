@@ -53,3 +53,28 @@ def test_slot_matches_a_merged_lora():
 
 def test_input_names_pair_a_and_b_per_layer():
     assert slot_input_names(2) == ("lora_a_0", "lora_b_0", "lora_a_1", "lora_b_1")
+
+
+def test_shape_function_names_keep_the_square_defaults():
+    from coreai_models.diffusion.lora_slot import shape_function_names
+
+    assert shape_function_names(1024, 1024) == ("main", "img2img_full")
+    assert shape_function_names(864, 1152) == ("t2i_864x1152", "img2img_864x1152_full")
+
+
+def test_rewrap_gives_fresh_slot_modules_over_the_same_weights():
+    from coreai_models.diffusion.lora_slot import SlotTransformer, _rewrap
+
+    class Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = torch.nn.Module()
+            self.attn.to_q = torch.nn.Linear(4, 4)
+
+    model = Tiny()
+    wrapper = SlotTransformer(model)
+    before = model.attn.to_q
+    _rewrap(wrapper)
+    after = model.attn.to_q
+    assert after is not before and after.base is before.base
+    assert after.ctx is wrapper.ctx and all(v is None for v in wrapper.ctx)

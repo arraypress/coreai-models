@@ -108,6 +108,15 @@ def build_parser() -> argparse.ArgumentParser:
         "match the plain export exactly. See coreai_models/diffusion/lora_slot.py.",
     )
     parser.add_argument(
+        "--lora-slot-shapes",
+        default=None,
+        metavar="HxW,HxW,...",
+        help="With --lora-slot: one asset (TransformerShapes.aimodel) holding a text-to-image "
+        "and a full-grid img2img function per shape, all sharing one copy of the weights, "
+        "e.g. 1024x1024,864x1152. Sides must be multiples of 32. Each shape's VAE decoder "
+        "and encoder go into shapes/HxW/.",
+    )
+    parser.add_argument(
         "--experimental",
         action="store_true",
         help="Allow exporting models without a registry preset. Requires --compute-precision.",
@@ -212,11 +221,19 @@ def main() -> None:
         if args.dry_run:
             print(f"Dry run — LoRA-slot transformer, rank {args.lora_slot}, for {hf_model_id} → {output_dir}")
             return
-        from coreai_models.diffusion.lora_slot import export_lora_slot
+        from coreai_models.diffusion.lora_slot import export_lora_slot, export_lora_slot_shapes, export_vae_shape
 
         try:
-            asset = export_lora_slot(hf_model_id, output_dir, args.lora_slot, compute_precision,
-                                     include_debug_info=args.include_debug_info)
+            if args.lora_slot_shapes:
+                shapes = [tuple(int(v) for v in item.lower().split("x")) for item in args.lora_slot_shapes.split(",")]
+                asset = export_lora_slot_shapes(hf_model_id, output_dir, args.lora_slot, shapes,
+                                                compute_precision or "float16")
+                for height, width in shapes:
+                    export_vae_shape(hf_model_id, Path(output_dir) / "shapes" / f"{height}x{width}",
+                                     height, width, compute_precision or "float16")
+            else:
+                asset = export_lora_slot(hf_model_id, output_dir, args.lora_slot, compute_precision,
+                                         include_debug_info=args.include_debug_info)
         except Exception as e:
             logging.getLogger(__name__).error(f"Export failed: {e}")
             sys.exit(1)

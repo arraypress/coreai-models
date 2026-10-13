@@ -11,15 +11,20 @@ import Foundation
 public enum CGImageUtils {
     /// Resize a CGImage to `side × side` using CGContext with high-quality interpolation.
     public static func resize(_ image: CGImage, to side: Int) -> CGImage? {
+        resize(image, width: side, height: side)
+    }
+
+    /// Resize a CGImage to `width × height` (stretching; callers fit the aspect first).
+    public static func resize(_ image: CGImage, width: Int, height: Int) -> CGImage? {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
             let ctx = CGContext(
-                data: nil, width: side, height: side,
-                bitsPerComponent: 8, bytesPerRow: 4 * side,
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 4 * width,
                 space: colorSpace,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         ctx.interpolationQuality = .high
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return ctx.makeImage()
     }
 

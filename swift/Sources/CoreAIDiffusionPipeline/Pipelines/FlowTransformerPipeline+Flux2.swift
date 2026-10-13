@@ -78,8 +78,6 @@ extension FlowTransformerPipeline {
         let textSeqLen = textEmbeddings.count / hiddenDim(textEmbeddings)
 
         // 2. Determine latent dimensions from image size
-        let imageSize = defaultImageSize.width
-        let spatialSide = imageSize / Self.patchSize
         // A non-square export traces the transformer on a rows × cols token grid.
         let rows = defaultImageSize.height / Self.patchSize
         let cols = defaultImageSize.width / Self.patchSize
@@ -97,9 +95,11 @@ extension FlowTransformerPipeline {
         // half-resolution VAE encoder (traced for 512×512), but the reference is
         // encoded at the full image size — feeding it a 1024 image crashes on a
         // shape mismatch. Fail early with a clear message instead.
-        if isActuallyImg2Img && isNonSquare {
+        // A non-square export traces img2img at its own rows × cols grid, with the
+        // reference at the same grid: the half and quarter reference grids are square.
+        if isActuallyImg2Img && isNonSquare && configuration.referenceGrid != .full {
             throw PipelineLoadError.unsupportedConfiguration(
-                "img2img needs a square export; this one is \(defaultImageSize.width)×\(defaultImageSize.height).")
+                "a non-square edit uses the full reference grid; got \(configuration.referenceGrid).")
         }
         if isActuallyImg2Img && mode == .tiled {
             throw PipelineLoadError.unsupportedConfiguration(
@@ -121,7 +121,7 @@ extension FlowTransformerPipeline {
         )
         if let partial { scheduler.setBeginIndex(partial.begin) }
 
-        // 4. Generate noise [1, inChannels, spatialSide, spatialSide]
+        // 4. Generate noise [1, inChannels, rows, cols]
         let latentShape = [1, inChannels, rows, cols]
         let latentCount = latentShape.reduce(1, *)
         let noise = generateNoise(count: latentCount, seed: configuration.seed, sourceType: .torch)
@@ -131,7 +131,8 @@ extension FlowTransformerPipeline {
         // 5. Initialize reference tokens. Latents start from pure noise at strength 1,
         // and from the first reference blended with noise below it.
         var referenceTokens: [Float]?
-        var refSide: Int = 0
+        var refRows = 0
+        var refCols = 0
         /// The first reference at full grid: what a strength below 1 starts from.
         var sourceLatents: [Float]?
 
@@ -150,16 +151,16 @@ extension FlowTransformerPipeline {
                 throw PipelineLoadError.unsupportedConfiguration(
                     "several reference images need the full reference grid.")
             }
-            refSide = spatialSide
-            let quarterSide = spatialSide / 2
+            refRows = rows
+            refCols = cols
             var quarters: [[Float]] = []
             for image in references {
                 let full = try await encodeReferenceImage(
-                    encoder: enc, srcImage: image, imageSize: imageSize,
-                    spatialSide: spatialSide, inChannels: inChannels)
+                    encoder: enc, srcImage: image, rows: rows, cols: cols, inChannels: inChannels)
                 if sourceLatents == nil { sourceLatents = full }
                 quarters.append(Self.subsampleTokens(
-                    full, fromSide: spatialSide, toSide: quarterSide, channels: inChannels))
+                    full, fromRows: rows, fromCols: cols, toRows: rows / 2, toCols: cols / 2,
+                    channels: inChannels))
             }
             referenceSlots = Self.referenceSlots(count: references.count)
             referenceTokens = referenceSlots.flatMap { quarters[$0] }
@@ -169,24 +170,26 @@ extension FlowTransformerPipeline {
             let srcImage = references.first
         {
             // Reference grid size based on the requested reference grid
+            let divisor: Int
             switch configuration.referenceGrid {
-            case .full: refSide = spatialSide  // 64×64 = 4096 tokens
-            case .half: refSide = spatialSide / 2  // 32×32 = 1024 tokens
-            case .quarter: refSide = spatialSide / 4  // 16×16 = 256 tokens
+            case .full: divisor = 1  // 64×64 = 4096 tokens
+            case .half: divisor = 2  // 32×32 = 1024 tokens
+            case .quarter: divisor = 4  // 16×16 = 256 tokens
             }
+            refRows = rows / divisor
+            refCols = cols / divisor
 
             // Encode reference at full resolution, then subsample tokens if needed
             let fullRefPacked = try await encodeReferenceImage(
-                encoder: enc, srcImage: srcImage, imageSize: imageSize,
-                spatialSide: spatialSide, inChannels: inChannels
-            )
+                encoder: enc, srcImage: srcImage, rows: rows, cols: cols, inChannels: inChannels)
             sourceLatents = fullRefPacked
             let refPacked: [Float]
-            if refSide == spatialSide {
+            if divisor == 1 {
                 refPacked = fullRefPacked
             } else {
                 refPacked = Self.subsampleTokens(
-                    fullRefPacked, fromSide: spatialSide, toSide: refSide, channels: inChannels)
+                    fullRefPacked, fromRows: rows, fromCols: cols, toRows: refRows, toCols: refCols,
+                    channels: inChannels)
             }
             referenceTokens = refPacked
             if configuration.lazyModelLoading { await enc.unloadResources() }
@@ -206,17 +209,17 @@ extension FlowTransformerPipeline {
             throw PipelineLoadError.missingConfig(
                 "rope_axes_dims has \(axisCount) axes; FLUX.2 RoPE needs at least 3")
         }
-        let refSeqLen = refSide * refSide
+        let refSeqLen = refRows * refCols
         // img2img appends reference tokens after the noise tokens, marked T=10 on axis 0
         // so the transformer's in-graph RoPE separates them from the noise grid.
         let imageIds: [Float]
         if !referenceSlots.isEmpty {
             imageIds = Self.buildImageIdsWithReferences(
-                noiseSide: spatialSide, slots: referenceSlots, slotSide: spatialSide / 2,
-                axisCount: axisCount)
+                noiseRows: rows, noiseCols: cols, slots: referenceSlots,
+                slotRows: rows / 2, slotCols: cols / 2, axisCount: axisCount)
         } else if referenceTokens != nil {
             imageIds = buildImageIdsWithReference(
-                noiseSide: spatialSide, refSide: refSide, axisCount: axisCount)
+                noiseRows: rows, noiseCols: cols, refRows: refRows, refCols: refCols, axisCount: axisCount)
         } else {
             imageIds = buildImageIds(rows: rows, cols: cols, axisCount: axisCount)
         }
@@ -390,23 +393,24 @@ extension FlowTransformerPipeline {
     private func encodeReferenceImage(
         encoder: CoreAIDiffusionModelFunction,
         srcImage: CGImage,
-        imageSize: Int,
-        spatialSide: Int,
+        rows: Int,
+        cols: Int,
         inChannels: Int
     ) async throws -> [Float] {
-        let resized = CGImageUtils.resize(srcImage, to: imageSize) ?? srcImage
+        let width = cols * Self.patchSize, height = rows * Self.patchSize
+        let resized = CGImageUtils.resize(srcImage, width: width, height: height) ?? srcImage
         let encoderScaleFactor = config.encoderScaleFactor ?? DiffusionDefaults.Image.scaleFactor
 
         let imagePixels = try CGImageUtils.toNormalizedPlanarRGB(resized)
-        let encodedFloats = try await encoder.run(floatInputs: [(imagePixels, [1, 3, imageSize, imageSize])])
+        let encodedFloats = try await encoder.run(floatInputs: [(imagePixels, [1, 3, height, width])])
 
         let scaledEncoded = encodedFloats.map { $0 * encoderScaleFactor }
         let patchified = Self.patchifyLatents(
-            scaledEncoded, inChannels: inChannels, height: spatialSide, width: spatialSide)
+            scaledEncoded, inChannels: inChannels, height: rows, width: cols)
         let normalized = applyBatchNormNorm(
-            patchified, channels: inChannels, height: spatialSide, width: spatialSide)
+            patchified, channels: inChannels, height: rows, width: cols)
         return packLatentsSpatialFlatten(
-            normalized, channels: inChannels, height: spatialSide, width: spatialSide)
+            normalized, channels: inChannels, height: rows, width: cols)
     }
 
     // MARK: - Text Encoding
@@ -495,23 +499,23 @@ extension FlowTransformerPipeline {
     /// Reference rows carry T=10 on axis 0 so in-graph RoPE keeps them positionally
     /// distinct from the noise grid even where H/W coincide.
     private func buildImageIdsWithReference(
-        noiseSide: Int, refSide: Int, axisCount: Int
+        noiseRows: Int, noiseCols: Int, refRows: Int, refCols: Int, axisCount: Int
     ) -> [Float] {
-        let noiseSeq = noiseSide * noiseSide
-        let refSeq = refSide * refSide
+        let noiseSeq = noiseRows * noiseCols
+        let refSeq = refRows * refCols
         var ids = [Float](repeating: 0, count: (noiseSeq + refSeq) * axisCount)
 
-        for h in 0..<noiseSide {
-            for w in 0..<noiseSide {
-                let idx = h * noiseSide + w
+        for h in 0..<noiseRows {
+            for w in 0..<noiseCols {
+                let idx = h * noiseCols + w
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
             }
         }
 
-        for h in 0..<refSide {
-            for w in 0..<refSide {
-                let idx = noiseSeq + h * refSide + w
+        for h in 0..<refRows {
+            for w in 0..<refCols {
+                let idx = noiseSeq + h * refCols + w
                 ids[idx * axisCount + 0] = Self.referenceTokenTimeOffset
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
@@ -530,22 +534,22 @@ extension FlowTransformerPipeline {
     /// Reference `r` carries T = 10 + 10·r on axis 0 (diffusers' `scale + scale * i`),
     /// so slots holding the same reference share ids and separate references stay apart.
     static func buildImageIdsWithReferences(
-        noiseSide: Int, slots: [Int], slotSide: Int, axisCount: Int
+        noiseRows: Int, noiseCols: Int, slots: [Int], slotRows: Int, slotCols: Int, axisCount: Int
     ) -> [Float] {
-        let noiseSeq = noiseSide * noiseSide
-        let slotSeq = slotSide * slotSide
+        let noiseSeq = noiseRows * noiseCols
+        let slotSeq = slotRows * slotCols
         var ids = [Float](repeating: 0, count: (noiseSeq + slots.count * slotSeq) * axisCount)
-        for h in 0..<noiseSide {
-            for w in 0..<noiseSide {
-                let idx = h * noiseSide + w
+        for h in 0..<noiseRows {
+            for w in 0..<noiseCols {
+                let idx = h * noiseCols + w
                 ids[idx * axisCount + 1] = Float(h)
                 ids[idx * axisCount + 2] = Float(w)
             }
         }
         for (slot, reference) in slots.enumerated() {
-            for h in 0..<slotSide {
-                for w in 0..<slotSide {
-                    let idx = noiseSeq + slot * slotSeq + h * slotSide + w
+            for h in 0..<slotRows {
+                for w in 0..<slotCols {
+                    let idx = noiseSeq + slot * slotSeq + h * slotCols + w
                     ids[idx * axisCount + 0] = referenceTokenTimeOffset * Float(reference + 1)
                     ids[idx * axisCount + 1] = Float(h)
                     ids[idx * axisCount + 2] = Float(w)
@@ -576,16 +580,25 @@ extension FlowTransformerPipeline {
     static func subsampleTokens(
         _ tokens: [Float], fromSide: Int, toSide: Int, channels: Int
     ) -> [Float] {
-        let stride = fromSide / toSide
+        subsampleTokens(
+            tokens, fromRows: fromSide, fromCols: fromSide, toRows: toSide, toCols: toSide, channels: channels)
+    }
+
+    /// ``subsampleTokens(_:fromSide:toSide:channels:)`` on a rows × cols grid; both
+    /// sides shrink by the same stride.
+    static func subsampleTokens(
+        _ tokens: [Float], fromRows: Int, fromCols: Int, toRows: Int, toCols: Int, channels: Int
+    ) -> [Float] {
+        let stride = fromRows / toRows
         let scale = 1.0 / Float(stride * stride)
-        var result = [Float](repeating: 0, count: toSide * toSide * channels)
-        for h in 0..<toSide {
-            for w in 0..<toSide {
-                let dstIdx = (h * toSide + w) * channels
+        var result = [Float](repeating: 0, count: toRows * toCols * channels)
+        for h in 0..<toRows {
+            for w in 0..<toCols {
+                let dstIdx = (h * toCols + w) * channels
                 for bh in 0..<stride {
                     let srcRow = h * stride + bh
                     for bw in 0..<stride {
-                        let srcIdx = (srcRow * fromSide + w * stride + bw) * channels
+                        let srcIdx = (srcRow * fromCols + w * stride + bw) * channels
                         for c in 0..<channels {
                             result[dstIdx + c] += tokens[srcIdx + c]
                         }

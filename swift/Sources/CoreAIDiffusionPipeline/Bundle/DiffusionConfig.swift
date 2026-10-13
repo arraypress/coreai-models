@@ -25,6 +25,12 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     /// override `imageSize`; a square export leaves them out.
     public let imageWidth: Int?
     public let imageHeight: Int?
+    /// The text-to-image function of a multi-shape transformer (e.g. `t2i_864x1152`);
+    /// `nil` means `"main"`. Lets one asset serve several shapes, one folder each.
+    public let transformerFunction: String?
+    /// The img2img entrypoint prefix of a multi-shape transformer (e.g.
+    /// `img2img_864x1152_`, completed by the reference grid); `nil` means `"img2img_"`.
+    public let img2imgFunctionPrefix: String?
 
     public let encoderScaleFactor: Float?
     public let decoderScaleFactor: Float?
@@ -66,6 +72,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         imageSize: Int? = nil,
         imageWidth: Int? = nil,
         imageHeight: Int? = nil,
+        transformerFunction: String? = nil,
+        img2imgFunctionPrefix: String? = nil,
         encoderScaleFactor: Float? = nil,
         decoderScaleFactor: Float? = nil,
         decoderShiftFactor: Float? = nil,
@@ -88,6 +96,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.imageSize = imageSize
         self.imageWidth = imageWidth
         self.imageHeight = imageHeight
+        self.transformerFunction = transformerFunction
+        self.img2imgFunctionPrefix = img2imgFunctionPrefix
         self.encoderScaleFactor = encoderScaleFactor
         self.decoderScaleFactor = decoderScaleFactor
         self.decoderShiftFactor = decoderShiftFactor
@@ -112,6 +122,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         case imageSize = "image_size"
         case imageWidth = "image_width"
         case imageHeight = "image_height"
+        case transformerFunction = "transformer_function"
+        case img2imgFunctionPrefix = "img2img_function_prefix"
         case encoderScaleFactor = "encoder_scale_factor"
         case decoderScaleFactor = "decoder_scale_factor"
         case decoderShiftFactor = "decoder_shift_factor"
@@ -141,6 +153,8 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
         self.imageSize = try c.decodeIfPresent(Int.self, forKey: .imageSize)
         self.imageWidth = try c.decodeIfPresent(Int.self, forKey: .imageWidth)
         self.imageHeight = try c.decodeIfPresent(Int.self, forKey: .imageHeight)
+        self.transformerFunction = try c.decodeIfPresent(String.self, forKey: .transformerFunction)
+        self.img2imgFunctionPrefix = try c.decodeIfPresent(String.self, forKey: .img2imgFunctionPrefix)
         self.encoderScaleFactor = try c.decodeIfPresent(Float.self, forKey: .encoderScaleFactor)
         self.decoderScaleFactor = try c.decodeIfPresent(Float.self, forKey: .decoderScaleFactor)
         self.decoderShiftFactor = try c.decodeIfPresent(Float.self, forKey: .decoderShiftFactor)
