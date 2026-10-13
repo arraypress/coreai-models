@@ -119,12 +119,18 @@ def export_lora_slot(
     rank: int,
     compute_precision: str = "float16",
     include_debug_info: bool = False,
+    height: int = 1024,
+    width: int = 1024,
+    img2img: bool = False,
 ) -> Path:
-    """Export the text-to-image transformer of ``hf_model_id`` with a rank-``rank`` slot.
+    """Export one transformer function of ``hf_model_id`` with a rank-``rank`` slot.
 
-    Writes ``Transformer.aimodel`` and ``slot.json`` into ``output_dir`` and returns the
-    asset's path. Only the transformer is loaded (the full pipeline would also load the
-    8 GB text encoder); the text encoder, VAEs and tokenizer of a plain export are shared.
+    Text to image (``Transformer.aimodel``) or, with ``img2img``, the full-grid img2img
+    function (``Transformer_img2img_full.aimodel``: noise tokens plus one reference grid
+    the same size), traced at ``height`` × ``width``; writes ``slot.json`` beside it
+    (``"img2img": true`` for the editing one) and returns the asset's path. Only the
+    transformer is loaded (the full pipeline would also load the 8 GB text encoder); the
+    text encoder, VAEs and tokenizer of a plain export are shared.
     """
     from types import SimpleNamespace
 
@@ -140,7 +146,10 @@ def export_lora_slot(
     started = time.time()
     transformer = Flux2Transformer2DModel.from_pretrained(hf_model_id, subfolder="transformer", torch_dtype=dtype)
     wrapper = SlotTransformer(transformer)
-    base_inputs = dummy_flux2_transformer(SimpleNamespace(transformer=transformer))
+    if (height, width) == (1024, 1024) and not img2img:
+        base_inputs = dummy_flux2_transformer(SimpleNamespace(transformer=transformer))
+    else:
+        base_inputs = _shape_inputs(transformer, height // 16, width // 16, img2img, dtype)
     # Small random matrices so tracing sees real data flow through every slot.
     generator = torch.Generator().manual_seed(0)
     extra: list[torch.Tensor] = []
@@ -162,12 +171,34 @@ def export_lora_slot(
     )
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
-    asset = out / "Transformer.aimodel"
+    asset = out / ("Transformer_img2img_full.aimodel" if img2img else "Transformer.aimodel")
     # save_asset needs a Path: a str fails only after the whole conversion.
     program.save_asset(asset, build_aimodel_metadata(hf_model_id, component="Transformer"))
-    (out / "slot.json").write_text(json.dumps(wrapper.layout(rank), indent=1))
+    layout = wrapper.layout(rank) | ({"img2img": True} if img2img else {})
+    (out / "slot.json").write_text(json.dumps(layout, indent=1))
     logger.info(f"LoRA-slot transformer exported in {time.time() - started:.0f}s: {asset}")
     return asset
+
+
+def _shape_inputs(transformer: torch.nn.Module, rows: int, cols: int, reference: bool,
+                  dtype: torch.dtype) -> tuple[torch.Tensor, ...]:
+    """Dummy inputs for one transformer function on a ``rows`` × ``cols`` token grid;
+    with ``reference``, a second grid the same size marked by the reference time offset."""
+    from coreai_models.diffusion.flux2 import REFERENCE_TOKEN_TIME_OFFSET, _rect_position_ids, _text_position_ids
+
+    cfg = transformer.config
+    axes = len(list(cfg.axes_dims_rope))
+    ids = _rect_position_ids(rows, cols, axes)
+    if reference:
+        ids = torch.cat([ids, _rect_position_ids(rows, cols, axes, time_offset=REFERENCE_TOKEN_TIME_OFFSET)])
+    return (
+        torch.randn(1, ids.shape[0], cfg.in_channels, dtype=dtype),
+        torch.randn(1, 512, cfg.joint_attention_dim, dtype=dtype),
+        torch.tensor([0.5], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+        ids.unsqueeze(0),
+        _text_position_ids(512, axes),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +250,11 @@ def export_lora_slot_shapes(
     the weights: measured on Klein 4B, two shapes made a 7.2 GB asset, the size of one,
     and the 1:1 function's output was bit-identical to the single-shape slot export.
 
-    Trap, measured: Core AI compiles each function on first use and its cache keeps the
-    compiled weights PER FUNCTION (≈7 GB each for Klein 4B), so the download is shared but
-    the compiled cache grows with every shape a caller actually uses.
+    TRAP, measured: Core AI compiles EVERY function of the asset when it loads it, and its
+    cache keeps the compiled weights per function — ≈7.5 GB each for Klein 4B, 116 GB for
+    sixteen. The download is shared; the disk is not. For a model this size, export one
+    function per asset (:func:`export_lora_slot` with ``height``/``width``/``img2img``)
+    and fetch only the ones a caller uses.
 
     Writes ``TransformerShapes.aimodel`` and ``slot.json`` (which also lists the
     functions and marks img2img as slotted) into ``output_dir``.

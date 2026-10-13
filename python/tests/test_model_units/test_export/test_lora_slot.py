@@ -78,3 +78,18 @@ def test_rewrap_gives_fresh_slot_modules_over_the_same_weights():
     after = model.attn.to_q
     assert after is not before and after.base is before.base
     assert after.ctx is wrapper.ctx and all(v is None for v in wrapper.ctx)
+
+
+def test_shape_inputs_double_the_grid_for_a_reference():
+    from types import SimpleNamespace
+
+    from coreai_models.diffusion.lora_slot import _shape_inputs
+
+    transformer = SimpleNamespace(config=SimpleNamespace(axes_dims_rope=[32, 32, 32, 32], in_channels=128,
+                                                         joint_attention_dim=64))
+    plain = _shape_inputs(transformer, 54, 72, False, torch.float32)
+    edit = _shape_inputs(transformer, 54, 72, True, torch.float32)
+    assert plain[0].shape == (1, 54 * 72, 128) and edit[0].shape == (1, 2 * 54 * 72, 128)
+    ids = edit[4][0]
+    assert ids[0, 0] == 0 and ids[54 * 72, 0] == 10
+    assert ids[54 * 72 - 1, 1] == 53 and ids[54 * 72 - 1, 2] == 71

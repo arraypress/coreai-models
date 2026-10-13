@@ -108,13 +108,26 @@ def build_parser() -> argparse.ArgumentParser:
         "match the plain export exactly. See coreai_models/diffusion/lora_slot.py.",
     )
     parser.add_argument(
+        "--lora-slot-shape",
+        default=None,
+        metavar="HxW",
+        help="With --lora-slot: trace the one function at this height × width instead of 1024x1024.",
+    )
+    parser.add_argument(
+        "--lora-slot-img2img",
+        action="store_true",
+        help="With --lora-slot: export the full-grid img2img (editing) function, "
+        "Transformer_img2img_full.aimodel, instead of text to image.",
+    )
+    parser.add_argument(
         "--lora-slot-shapes",
         default=None,
         metavar="HxW,HxW,...",
         help="With --lora-slot: one asset (TransformerShapes.aimodel) holding a text-to-image "
         "and a full-grid img2img function per shape, all sharing one copy of the weights, "
         "e.g. 1024x1024,864x1152. Sides must be multiples of 32. Each shape's VAE decoder "
-        "and encoder go into shapes/HxW/.",
+        "and encoder go into shapes/HxW/. Trap: Core AI compiles every function at load and "
+        "caches each one (~7.5 GB per function for Klein 4B) — prefer one asset per function.",
     )
     parser.add_argument(
         "--experimental",
@@ -232,8 +245,10 @@ def main() -> None:
                     export_vae_shape(hf_model_id, Path(output_dir) / "shapes" / f"{height}x{width}",
                                      height, width, compute_precision or "float16")
             else:
+                height, width = (int(v) for v in (args.lora_slot_shape or "1024x1024").lower().split("x"))
                 asset = export_lora_slot(hf_model_id, output_dir, args.lora_slot, compute_precision,
-                                         include_debug_info=args.include_debug_info)
+                                         include_debug_info=args.include_debug_info, height=height, width=width,
+                                         img2img=args.lora_slot_img2img)
         except Exception as e:
             logging.getLogger(__name__).error(f"Export failed: {e}")
             sys.exit(1)

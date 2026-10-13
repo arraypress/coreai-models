@@ -50,8 +50,11 @@ extension FlowTransformerPipeline {
         case .full, .tiled:
             // The metadata's own path first: a shape folder of a multi-shape export names
             // a transformer outside it (`../../TransformerShapes.aimodel`).
+            // A folder holding only the editing transformer (fetched without its text-to-image
+            // sibling) loads with it in both roles; text to image there is the caller's to refuse.
             guard let path = Self.listedAsset(bundle.transformerFilename, at: url)
-                ?? Self.resolveAsset(at: url, name: AssetName.transformer) else {
+                ?? Self.resolveAsset(at: url, name: AssetName.transformer)
+                ?? Self.resolveAsset(at: url, name: "\(AssetName.transformer)_img2img_full") else {
                 throw PipelineLoadError.missingComponent(AssetName.transformer)
             }
             transformer = CoreAIDiffusionModelFunction(modelURL: url.appendingPathComponent(path))
