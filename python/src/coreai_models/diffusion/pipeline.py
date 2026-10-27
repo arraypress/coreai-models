@@ -173,6 +173,10 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
+    if pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import save_flux3_sidecars
+
+        save_flux3_sidecars(hf_pipe, output_path, overwrite=config.overwrite)
     elif pipeline_type == "sana_sprint":
         _save_pipeline_tokenizer(hf_pipe, output_path, overwrite=config.overwrite)
     else:
@@ -211,6 +215,11 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
+
+    if pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import Flux3Parts
+
+        return Flux3Parts(model_id, model_dtype)
 
     if pipeline_type == "sana_sprint":
         from diffusers import SanaSprintPipeline
@@ -373,6 +382,10 @@ def _write_metadata_json(
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import build_flux3_config
+
+        diffusion_config = build_flux3_config(hf_pipe)
     elif pipeline_type == "sana_sprint":
         diffusion_config = _build_sana_sprint_config(hf_pipe)
     elif pipeline_type == "wan":

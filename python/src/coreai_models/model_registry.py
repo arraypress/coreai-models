@@ -428,6 +428,17 @@ DIFFUSION_PRESETS: list[ModelPreset] = [
         notes="4bit recommended; use --compression none for full precision",
     ),
     ModelPreset(
+        "flux3-klein",
+        "black-forest-labs/flux-3-image-klein",
+        "flux3",
+        "diffusion",
+        None,
+        "none",
+        "bfloat16",
+        None,
+        notes="bfloat16 required: the transformer overflows float16 (NaN). Gated: FLUX Kommunity licence.",
+    ),
+    ModelPreset(
         "wan-t2v-1.3b",
         "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
         "wan",

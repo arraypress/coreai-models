@@ -13,6 +13,7 @@ the families known to work end-to-end through the export pipeline.
 # Each entry: (family name, example HF model ID, pipeline_type)
 SUPPORTED_MODELS: list[tuple[str, str, str]] = [
     ("flux2", "black-forest-labs/FLUX.2-klein-4B", "flux2"),
+    ("flux3-klein", "black-forest-labs/flux-3-image-klein", "flux3"),
     ("wan-t2v-1.3b", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers", "wan"),
     ("sana-sprint-0.6b", "Efficient-Large-Model/Sana_Sprint_0.6B_1024px_diffusers", "sana_sprint"),
 ]

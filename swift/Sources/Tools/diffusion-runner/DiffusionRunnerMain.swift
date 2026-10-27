@@ -129,7 +129,7 @@ struct DiffusionRunner: AsyncParsableCommand {
         // Determine pipeline type and dispatch
         let bundle = try DiffusionBundle(at: bundleURL)
         let diffusion = bundle.config
-        let isFlowTransformer = diffusion.type == .flux2 || diffusion.type == .sanaSprint
+        let isFlowTransformer = diffusion.type == .flux2 || diffusion.type == .flux3 || diffusion.type == .sanaSprint
 
         guard isFlowTransformer else {
             if let type = diffusion.type {
@@ -185,7 +185,7 @@ struct DiffusionRunner: AsyncParsableCommand {
             let pipeline = try await FlowTransformerPipeline(
                 from: bundleURL, mode: decodeResolution)
 
-            let family = diffusion.type == .sanaSprint ? "Sana Sprint" : "FLUX.2"
+            let family = diffusion.type == .sanaSprint ? "Sana Sprint" : diffusion.type == .flux3 ? "FLUX.3" : "FLUX.2"
             print("Generating (\(family)): \"\(prompt)\"")
             print("Steps: \(effectiveSteps), Guidance: \(effectiveGuidance), Seed: \(seed)")
             print("Image size: \(pipeline.defaultImageSize.width)x\(pipeline.defaultImageSize.height)")

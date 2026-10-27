@@ -240,3 +240,115 @@ def flux3_text_encoder_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
     windows = torch.export.Dim("text_windows", min=1, max=MAX_TEXT_WINDOWS)
     text_len = TEXT_PAD_MULTIPLE * windows
     return ({1: text_len}, {1: text_len}, {1: text_len})
+
+
+# ---------------------------------------------------------------------------
+# Loading: the large parts one at a time
+# ---------------------------------------------------------------------------
+
+
+class Flux3Parts:
+    """FLUX.3 [klein]'s parts for export, loaded only when a component's turn comes.
+
+    The transformer (11 GB at bfloat16) and the text encoder (8.9 GB) are never held at once:
+    `load_transformer()` and `load_text_encoder()` return fresh modules the export loop drops
+    after each asset. The VAE (0.3 GB), the tokenizer and the configs are kept.
+    """
+
+    def __init__(self, model_id: str, dtype: torch.dtype) -> None:
+        from diffusers import AutoencoderKLFlux2, Flux3Transformer2DModel
+        from transformers import AutoTokenizer
+
+        self.model_id = model_id
+        self.dtype = dtype
+        self.transformer_config = Flux3Transformer2DModel.load_config(model_id, subfolder="transformer")
+        self.vae = AutoencoderKLFlux2.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="text_encoder")
+
+    def load_transformer(self) -> torch.nn.Module:
+        from diffusers import Flux3Transformer2DModel
+
+        return Flux3Transformer2DModel.from_pretrained(self.model_id, subfolder="transformer", torch_dtype=self.dtype).eval()
+
+    def load_text_encoder(self) -> torch.nn.Module:
+        from transformers import Qwen3VLForConditionalGeneration
+
+        return Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, subfolder="text_encoder", torch_dtype=self.dtype).eval()
+
+
+def dummy_flux3_transformer_export(pipe: Flux3Parts) -> tuple[torch.Tensor, ...]:
+    """Trace inputs from the config alone (no model load): 1024², two text windows
+    (torch.export fixes a dimension traced at size 1)."""
+    cfg, dtype = pipe.transformer_config, pipe.dtype
+    text_len = 2 * TEXT_PAD_MULTIPLE
+    return (
+        torch.randn(1, 64 * 64, cfg["in_channels"], dtype=dtype),
+        torch.randn(1, text_len, cfg["joint_attention_dim"], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+        torch.tensor([0.990472], dtype=dtype),
+        image_position_ids(64, 64),
+        text_position_ids(text_len),
+    )
+
+
+def dummy_flux3_text_encoder_export(pipe: Flux3Parts) -> tuple[torch.Tensor, ...]:
+    return dummy_flux3_text_encoder(pipe, text_seq_len=2 * TEXT_PAD_MULTIPLE)
+
+
+# ---------------------------------------------------------------------------
+# Bundle metadata and sidecars
+# ---------------------------------------------------------------------------
+
+
+def build_flux3_config(pipe: Flux3Parts) -> dict:
+    """The `diffusion` block of metadata.json the Swift pipeline reads."""
+    vae_config = pipe.vae.config
+    cfg = pipe.transformer_config
+    return {
+        "type": "flux3",
+        "prediction_type": "flow_matching",
+        "encoder_scale_factor": getattr(vae_config, "scaling_factor", 1.0),
+        "decoder_scale_factor": getattr(vae_config, "scaling_factor", 1.0),
+        "decoder_shift_factor": getattr(vae_config, "shift_factor", 0.0),
+        "batch_norm_eps": getattr(vae_config, "batch_norm_eps", 1e-4),
+        "guidance_embeds": False,
+        "image_size": 1024,
+        "default_guidance_scale": 1.0,
+        "default_steps": NUM_INFERENCE_STEPS,
+        "default_shift": TIMESTEP_SHIFT,
+        "rope_axes_dims": list(cfg.get("axes_dims_rope", [32, 32, 32, 32])),
+        "rope_theta": cfg.get("rope_theta", 10000),
+        "text_pad_multiple": TEXT_PAD_MULTIPLE,
+        "text_max_windows": MAX_TEXT_WINDOWS,
+        "image_rope_scale": IMAGE_ROPE_SCALE,
+        "text_encoder_layers": list(TEXT_ENCODER_LAYERS),
+    }
+
+
+def save_flux3_sidecars(pipe: Flux3Parts, output_path: Any, overwrite: bool) -> None:
+    """The tokenizer (with Qwen3-VL's chat template inlined, which swift-transformers reads
+    from tokenizer_config.json) and the VAE batch-norm statistics FLUX.2 also ships."""
+    import json
+    import shutil
+    from pathlib import Path
+
+    import numpy as np
+
+    output_path = Path(output_path)
+    tok_dir = output_path / "tokenizer"
+    if overwrite or not tok_dir.exists():
+        if tok_dir.exists():
+            shutil.rmtree(tok_dir)
+        pipe.tokenizer.save_pretrained(str(tok_dir))
+        config_file = tok_dir / "tokenizer_config.json"
+        config = json.loads(config_file.read_text())
+        if pipe.tokenizer.chat_template and not config.get("chat_template"):
+            config["chat_template"] = pipe.tokenizer.chat_template
+        if config.get("tokenizer_class") in ("Qwen2Tokenizer", "Qwen2TokenizerFast"):
+            config["tokenizer_class"] = "GPT2Tokenizer"
+        config_file.write_text(json.dumps(config, indent=2))
+        if not (tok_dir / "config.json").exists():
+            shutil.copy2(config_file, tok_dir / "config.json")
+    bn = pipe.vae.bn
+    np.save(output_path / "vae_bn_mean.npy", bn.running_mean.float().cpu().numpy())
+    np.save(output_path / "vae_bn_var.npy", bn.running_var.float().cpu().numpy())
