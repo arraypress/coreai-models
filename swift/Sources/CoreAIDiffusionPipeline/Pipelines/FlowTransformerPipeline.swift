@@ -28,6 +28,8 @@ public struct Img2ImgRoute: Sendable {
 ///
 /// - `.flux2` (FLUX.2 Klein): Qwen3 encoder, packed tokens with RoPE ids, BN + unpatchify.
 ///   See `FlowTransformerPipeline+Flux2.swift`.
+/// - `.flux3` (FLUX.3 Klein): Qwen3-VL encoder (80-token windows), flow-map Euler steps,
+///   FLUX.2's packing and VAE. See `FlowTransformerPipeline+Flux3.swift`.
 /// - `.sanaSprint`: Gemma2 encoder, NCHW latents, SCM schedule with stochastic steps.
 ///   See `FlowTransformerPipeline+SanaSprint.swift`.
 public struct FlowTransformerPipeline: DiffusionPipeline {
@@ -160,10 +162,12 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         configuration: PipelineConfiguration,
         progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
-        var plan =
-            config.type == .sanaSprint
-            ? try await makeSanaSprintPlan(configuration)
-            : try await makeFlux2Plan(configuration)
+        var plan: DenoisingPlan
+        switch config.type {
+        case .sanaSprint: plan = try await makeSanaSprintPlan(configuration)
+        case .flux3: plan = try await makeFlux3Plan(configuration)
+        default: plan = try await makeFlux2Plan(configuration)
+        }
         let scheduler = plan.scheduler
         let steps = scheduler.inferenceStepCount
         // Strength img2img enters the schedule part-way; progress counts the steps that run.

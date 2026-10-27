@@ -615,7 +615,7 @@ extension FlowTransformerPipeline {
     // MARK: - Latent Packing/Unpacking
 
     /// (B, C, H, W) → (B, H*W, C) — spatial flatten for patch_size=1
-    private func packLatentsSpatialFlatten(_ latents: [Float], channels: Int, height: Int, width: Int) -> [Float] {
+    func packLatentsSpatialFlatten(_ latents: [Float], channels: Int, height: Int, width: Int) -> [Float] {
         let seqLen = height * width
         var packed = [Float](repeating: 0, count: seqLen * channels)
         for c in 0..<channels {
@@ -632,7 +632,7 @@ extension FlowTransformerPipeline {
     }
 
     /// (B, H*W, C) → (B, C, H, W) — inverse spatial flatten
-    private func unpackLatentsSpatialFlatten(_ packed: [Float], channels: Int, height: Int, width: Int) -> [Float] {
+    func unpackLatentsSpatialFlatten(_ packed: [Float], channels: Int, height: Int, width: Int) -> [Float] {
         var unpacked = [Float](repeating: 0, count: channels * height * width)
         for c in 0..<channels {
             for h in 0..<height {

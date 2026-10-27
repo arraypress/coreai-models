@@ -176,6 +176,7 @@ public struct DiffusionConfig: Codable, Sendable, Equatable {
     /// Fine-grained pipeline type for the image diffusion path.
     public enum PipelineType: String, Codable, Sendable {
         case flux2 = "flux2"
+        case flux3 = "flux3"
         case sanaSprint = "sana-sprint"
     }
 }

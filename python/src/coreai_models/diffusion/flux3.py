@@ -45,11 +45,40 @@ MAX_TEXT_WINDOWS = 13
 # ---------------------------------------------------------------------------
 
 
+def _joint_block_forward(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb_mod: torch.Tensor,
+    temb_mod_context: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flux3SingleTransformerBlock.forward with the text/content split taken from the content
+    end. diffusers splits at the text length, which is the dynamic dimension, and the Core AI
+    converter cannot split at a symbolic size; the content length is fixed by the image grid.
+    Same arithmetic, same result."""
+    mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
+    c_mod_shift, c_mod_scale, c_mod_gate = torch.chunk(temb_mod_context, 3, dim=-1)
+    norm_hidden_states = (1 + mod_scale) * self.norm(hidden_states) + mod_shift
+    norm_encoder_hidden_states = (1 + c_mod_scale) * self.norm(encoder_hidden_states) + c_mod_shift
+    combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+    output = self.attn(hidden_states=combined, image_rotary_emb=image_rotary_emb) + self.ff(combined)
+    content_len = hidden_states.shape[1]
+    context_output, content_output = output[:, :-content_len], output[:, -content_len:]
+    return encoder_hidden_states + c_mod_gate * context_output, hidden_states + mod_gate * content_output
+
+
 class Flux3TransformerWrapper(torch.nn.Module):
-    """Wraps Flux3Transformer2DModel for text-to-image export with in-graph RoPE."""
+    """Wraps Flux3Transformer2DModel for text-to-image export with in-graph RoPE.
+
+    The joint blocks take `_joint_block_forward`, so the dynamic text window exports."""
 
     def __init__(self, transformer: torch.nn.Module) -> None:
         super().__init__()
+        import types
+
+        for block in transformer.single_transformer_blocks:
+            block.forward = types.MethodType(_joint_block_forward, block)
         self.model = transformer
 
     def forward(
