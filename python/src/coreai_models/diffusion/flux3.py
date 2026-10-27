@@ -69,9 +69,15 @@ def _joint_block_forward(
 
 
 class Flux3TransformerWrapper(torch.nn.Module):
-    """Wraps Flux3Transformer2DModel for text-to-image export with in-graph RoPE.
+    """FLUX.3 [klein] text-to-image for export: Flux3Transformer2DModel.forward without the
+    reference-image path, line for line, with two export changes that keep the arithmetic:
 
-    The joint blocks take `_joint_block_forward`, so the dynamic text window exports."""
+    - the timestep embedding of 0 (what the text tokens are modulated by) is a constant, so it
+      is computed once and stored; diffusers builds it from `torch.zeros(..., dtype)`, a
+      `full` the Core AI converter types as float32 in a bfloat16 graph;
+    - the joint blocks take `_joint_block_forward` (the split at the content end), so the
+      dynamic text window exports.
+    """
 
     def __init__(self, transformer: torch.nn.Module) -> None:
         super().__init__()
@@ -80,6 +86,10 @@ class Flux3TransformerWrapper(torch.nn.Module):
         for block in transformer.single_transformer_blocks:
             block.forward = types.MethodType(_joint_block_forward, block)
         self.model = transformer
+        dtype = next(transformer.parameters()).dtype
+        with torch.no_grad():
+            zero = transformer.time_proj(torch.zeros(1, dtype=dtype))
+            self.register_buffer("zero_temb", transformer.timestep_embedder(zero.to(dtype))[:, None, :].clone())
 
     def forward(
         self,
@@ -90,18 +100,50 @@ class Flux3TransformerWrapper(torch.nn.Module):
         img_ids: torch.Tensor,
         txt_ids: torch.Tensor,
     ) -> torch.Tensor:
-        return cast(
-            torch.Tensor,
-            self.model(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                timestep=timestep,
-                img_ids=img_ids,
-                txt_ids=txt_ids,
-                target_timestep=target_timestep,
-                return_dict=False,
-            )[0],
+        m = self.model
+        dtype = hidden_states.dtype
+        batch_size, image_seq_len = hidden_states.shape[:2]
+
+        image_temb = m.timestep_embedder(m.time_proj(timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        target_temb = m.target_timestep_embedder(m.time_proj(target_timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        image_temb = image_temb + target_temb
+        zero_temb = self.zero_temb.to(dtype) + target_temb
+        image_temb = image_temb.expand(batch_size, image_seq_len, -1)
+
+        zero_temb_act = torch.nn.functional.silu(zero_temb)
+        txt_temb_act = zero_temb_act.expand(batch_size, encoder_hidden_states.shape[1], -1)
+        txt_early_mod = m.early_stream_modulations["txt"](txt_temb_act)
+        txt_single_mod = m.single_stream_modulations["txt"](txt_temb_act)
+        encoder_hidden_states = m.context_embedder(encoder_hidden_states)
+        txt_rotary_emb = m.pos_embed(txt_ids)
+
+        image_temb_act = torch.nn.functional.silu(image_temb)
+        image_early_mod = m.early_stream_modulations["image"](image_temb_act)
+        image_single_mod = m.single_stream_modulations["image"](image_temb_act)
+        hidden_states = m.x_embedders["image"](hidden_states)
+        image_rotary_emb = m.pos_embed(img_ids)
+
+        for block in m.txt_mode_blocks:
+            encoder_hidden_states = block(encoder_hidden_states, txt_early_mod, txt_rotary_emb)
+        for block in m.mode_blocks["image"]:
+            hidden_states = block(hidden_states, image_early_mod, image_rotary_emb)
+
+        joint_rotary_emb = (
+            torch.cat([txt_rotary_emb[0], image_rotary_emb[0]], dim=0),
+            torch.cat([txt_rotary_emb[1], image_rotary_emb[1]], dim=0),
         )
+        content_states = hidden_states
+        for block in m.single_transformer_blocks:
+            encoder_hidden_states, content_states = block(
+                hidden_states=content_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_mod=image_single_mod,
+                temb_mod_context=txt_single_mod,
+                image_rotary_emb=joint_rotary_emb,
+            )
+        hidden_states = content_states[:, :image_seq_len]
+        hidden_states = m.norm_out(hidden_states, image_temb)
+        return cast(torch.Tensor, m.proj_out(hidden_states))
 
 
 class Flux3TextEncoderWrapper(torch.nn.Module):
