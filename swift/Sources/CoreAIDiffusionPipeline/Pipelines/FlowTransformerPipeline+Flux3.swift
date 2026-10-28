@@ -9,7 +9,7 @@ import CoreAIShared
 import Tokenizers
 
 /// FLUX.3 [klein]: tokenize → Qwen3-VL encode (a window of 80, 160, … tokens) → noise →
-/// pack → 16 flow-map Euler steps → unpack → BN denorm → unpatchify → VAE decode.
+/// pack → flow-map Euler steps (the bundle's `default_steps`) → unpack → BN denorm → unpatchify → VAE decode.
 ///
 /// The latent packing, BN statistics and VAE are FLUX.2's, unchanged. What differs is the
 /// recipe, mirrored from diffusers' modular FLUX.3 pipeline (diffusers 0.41/0.42 dev,
@@ -29,7 +29,6 @@ extension FlowTransformerPipeline {
     static let flux3TextPadMultiple = 80
     static let flux3MaxTextWindows = 13
     static let flux3ImageRopeScale: Float = 0.5
-    static let flux3DefaultSteps = 16
     static let flux3TimestepShift: Float = 6.93
     private static let flux3AxisCount = 4
 

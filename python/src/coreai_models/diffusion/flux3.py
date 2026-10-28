@@ -33,8 +33,10 @@ import torch
 TEXT_PAD_MULTIPLE = 80
 TEXT_ENCODER_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)
 IMAGE_ROPE_SCALE = 0.5
-NUM_INFERENCE_STEPS = 16
 TIMESTEP_SHIFT = 6.93
+
+# diffusers runs 16 steps; 4 measured as good on text, faces, hands and crowds, in a quarter of the time.
+DEFAULT_STEPS = 4
 
 # The longest text window exported: 13 × 80 = 1040 tokens (a full scene caption is 150–400).
 MAX_TEXT_WINDOWS = 13
@@ -314,7 +316,7 @@ def build_flux3_config(pipe: Flux3Parts) -> dict:
         "guidance_embeds": False,
         "image_size": 1024,
         "default_guidance_scale": 1.0,
-        "default_steps": NUM_INFERENCE_STEPS,
+        "default_steps": DEFAULT_STEPS,
         "default_shift": TIMESTEP_SHIFT,
         "rope_axes_dims": list(cfg.get("axes_dims_rope", [32, 32, 32, 32])),
         "rope_theta": cfg.get("rope_theta", 10000),
