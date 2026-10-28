@@ -10,6 +10,7 @@ import Tokenizers
 
 /// FLUX.3 [klein]: tokenize → Qwen3-VL encode (a window of 80, 160, … tokens) → noise →
 /// pack → flow-map Euler steps (the bundle's `default_steps`) → unpack → BN denorm → unpatchify → VAE decode.
+/// An edit adds reference pictures, encoded once and attended to at every step.
 ///
 /// The latent packing, BN statistics and VAE are FLUX.2's, unchanged. What differs is the
 /// recipe, mirrored from diffusers' modular FLUX.3 pipeline (diffusers 0.41/0.42 dev,
@@ -58,22 +59,41 @@ extension FlowTransformerPipeline {
 
         let imageIds = Self.flux3ImageIds(rows: rows, cols: cols)
         let textIds = Self.flux3TextIds(textSeqLen: textSeqLen)
-        let denoiser = transformer
-        let fnName = transformerFunctionName
         let axisCount = Self.flux3AxisCount
+
+        // 5. Reference pictures, when editing: tokens the transformer attends to beside the
+        // image's, at timestep 0, never denoised. The generation still starts from noise.
+        let reference = try await flux3References(configuration, rows: rows, cols: cols, inChannels: inChannels)
+        let denoiser: CoreAIDiffusionModelFunction
+        let fnName: String
+        if reference != nil {
+            guard let route = img2imgRoutes[.full] else {
+                throw PipelineLoadError.unsupportedConfiguration(
+                    "this FLUX.3 bundle has no editing transformer (Transformer_img2img_full.aimodel).")
+            }
+            denoiser = route.function
+            fnName = route.entrypoint
+        } else {
+            denoiser = transformer
+            fnName = transformerFunctionName
+        }
 
         // The flow map predicts the velocity for a jump from σ to the next σ (0 after the last).
         let predict: (_ latents: [Float], _ step: Int, _ sigma: Float) async throws -> [Float] = { latents, step, sigma in
             let target = scheduler.sigmas[step + 1]
-            return try await denoiser.run(
-                floatInputs: [
-                    (latents, [1, seqLen, inChannels]),
-                    (textEmbeddings, [1, textSeqLen, textDim]),
-                    ([sigma], [1]),
-                    ([target], [1]),
-                    (imageIds, [seqLen, axisCount]),
-                    (textIds, [textSeqLen, axisCount]),
-                ], functionName: fnName, namedInputs: [:])
+            var inputs: [([Float], [Int])] = [
+                (latents, [1, seqLen, inChannels]),
+                (textEmbeddings, [1, textSeqLen, textDim]),
+                ([sigma], [1]),
+                ([target], [1]),
+                (imageIds, [seqLen, axisCount]),
+                (textIds, [textSeqLen, axisCount]),
+            ]
+            if let reference {
+                inputs.append((reference.tokens, [1, reference.count, inChannels]))
+                inputs.append((reference.ids, [reference.count, axisCount]))
+            }
+            return try await denoiser.run(floatInputs: inputs, functionName: fnName, namedInputs: [:])
         }
 
         // Unpack → BN denorm → unpatchify: (1, rows*cols, 128) → (1, 32, rows*2, cols*2).
@@ -93,6 +113,53 @@ extension FlowTransformerPipeline {
             denoiser: denoiser,
             initialNoise: noise,
             noiseShape: latentShape)
+    }
+
+    // MARK: - References
+
+    /// The reference tokens of an edit and their position ids, or nil without references.
+    ///
+    /// The editing transformer is traced with one full grid of reference tokens. One
+    /// reference fills it. Several share it as FLUX.2's do: each is encoded at the full
+    /// grid and area-averaged to a quarter, and the four quarters are dealt out in turn
+    /// (two references get two each, the first of three gets two). Each reference keeps
+    /// diffusers' FLUX.3 ids — its own grid from (0, 0), told apart by l = −1, −2, … — so
+    /// the slots of one reference carry identical ids.
+    func flux3References(
+        _ configuration: PipelineConfiguration, rows: Int, cols: Int, inChannels: Int
+    ) async throws -> (tokens: [Float], ids: [Float], count: Int)? {
+        let references = configuration.referenceImages
+        guard !references.isEmpty else { return nil }
+        guard let encoder else {
+            throw PipelineLoadError.unsupportedConfiguration("this FLUX.3 bundle has no VAE encoder to read references with.")
+        }
+        guard references.count <= Self.maxReferenceImages else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "FLUX.3 takes at most \(Self.maxReferenceImages) reference images here; got \(references.count).")
+        }
+        var encoded: [[Float]] = []
+        for image in references {
+            encoded.append(try await encodeReferenceImage(
+                encoder: encoder, srcImage: image, rows: rows, cols: cols, inChannels: inChannels))
+        }
+        if configuration.lazyModelLoading { await encoder.unloadResources() }
+        if encoded.count == 1 {
+            return (encoded[0], Self.flux3ImageIds(rows: rows, cols: cols, lCoord: -1), rows * cols)
+        }
+        let (slotRows, slotCols) = (rows / 2, cols / 2)
+        let quarters = encoded.map {
+            Self.subsampleTokens($0, fromRows: rows, fromCols: cols, toRows: slotRows, toCols: slotCols, channels: inChannels)
+        }
+        let slots = Self.referenceSlots(count: encoded.count)
+        return (slots.flatMap { quarters[$0] },
+                Self.flux3ReferenceIds(slots: slots, slotRows: slotRows, slotCols: slotCols),
+                slots.count * slotRows * slotCols)
+    }
+
+    /// Position ids for references dealt into quarter slots: each slot its reference's grid
+    /// from (0, 0) with l = −(1 + reference).
+    static func flux3ReferenceIds(slots: [Int], slotRows: Int, slotCols: Int) -> [Float] {
+        slots.flatMap { flux3ImageIds(rows: slotRows, cols: slotCols, lCoord: -Float(1 + $0)) }
     }
 
     // MARK: - Schedule

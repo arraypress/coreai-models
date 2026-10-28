@@ -46,4 +46,18 @@ struct Flux3RecipeTests {
         #expect(reference == [0, 0, 0, -1])
         #expect(FlowTransformerPipeline.flux3TextIds(textSeqLen: 3) == [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2])
     }
+
+    @Test("References dealt into quarters keep their own grid and their own l; one reference's slots match")
+    func referenceIds() {
+        // Two references: slots 0, 1, 0, 1 — four quarter grids of 1 × 2.
+        let slots = FlowTransformerPipeline.referenceSlots(count: 2)
+        #expect(slots == [0, 1, 0, 1])
+        let ids = FlowTransformerPipeline.flux3ReferenceIds(slots: slots, slotRows: 1, slotCols: 2)
+        #expect(ids.count == 4 * 2 * 4)
+        let slot = { (index: Int) in Array(ids[index * 8..<index * 8 + 8]) }
+        #expect(slot(0) == [0, 0, 0, -1, 0, 0, 0.5, -1], "each slot starts its grid at (0, 0)")
+        #expect(slot(1) == [0, 0, 0, -2, 0, 0, 0.5, -2], "the second reference is l = -2")
+        #expect(slot(2) == slot(0) && slot(3) == slot(1), "a reference's two slots carry identical ids")
+        #expect(FlowTransformerPipeline.referenceSlots(count: 3) == [0, 1, 2, 0], "the first of three gets two")
+    }
 }

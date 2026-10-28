@@ -148,6 +148,83 @@ class Flux3TransformerWrapper(torch.nn.Module):
         return cast(torch.Tensor, m.proj_out(hidden_states))
 
 
+class Flux3ImageCondTransformerWrapper(Flux3TransformerWrapper):
+    """FLUX.3 [klein] with reference images (image-to-image) for export: diffusers'
+    Flux3Transformer2DModel.forward with `image_cond_hidden_states`, line for line, with the same
+    two export changes as `Flux3TransformerWrapper`.
+
+    The reference tokens are a fixed-length input (`cond_seq_len`), so the content the joint
+    blocks split off from the text is still fixed: image tokens, then reference tokens. Several
+    references share that length, told apart only by their position ids (`l` = -1, -2, …), which
+    the runtime passes in `image_cond_ids`.
+    """
+
+    def forward(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        target_timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        image_cond_hidden_states: torch.Tensor,
+        image_cond_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        m = self.model
+        dtype = hidden_states.dtype
+        batch_size, image_seq_len = hidden_states.shape[:2]
+
+        image_temb = m.timestep_embedder(m.time_proj(timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        target_temb = m.target_timestep_embedder(m.time_proj(target_timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        image_temb = image_temb + target_temb
+        zero_temb = self.zero_temb.to(dtype) + target_temb
+        image_temb = image_temb.expand(batch_size, image_seq_len, -1)
+        zero_temb_act = torch.nn.functional.silu(zero_temb)
+
+        txt_temb_act = zero_temb_act.expand(batch_size, encoder_hidden_states.shape[1], -1)
+        txt_early_mod = m.early_stream_modulations["txt"](txt_temb_act)
+        txt_single_mod = m.single_stream_modulations["txt"](txt_temb_act)
+        encoder_hidden_states = m.context_embedder(encoder_hidden_states)
+        txt_rotary_emb = m.pos_embed(txt_ids)
+
+        image_temb_act = torch.nn.functional.silu(image_temb)
+        image_early_mod = m.early_stream_modulations["image"](image_temb_act)
+        image_single_mod = m.single_stream_modulations["image"](image_temb_act)
+        hidden_states = m.x_embedders["image"](hidden_states)
+        image_rotary_emb = m.pos_embed(img_ids)
+
+        cond_temb_act = zero_temb_act.expand(batch_size, image_cond_hidden_states.shape[1], -1)
+        cond_early_mod = m.early_stream_modulations["image_cond"](cond_temb_act)
+        cond_single_mod = m.single_stream_modulations["image_cond"](cond_temb_act)
+        image_cond_hidden_states = m.x_embedders["image_cond"](image_cond_hidden_states)
+        cond_rotary_emb = m.pos_embed(image_cond_ids)
+
+        for block in m.txt_mode_blocks:
+            encoder_hidden_states = block(encoder_hidden_states, txt_early_mod, txt_rotary_emb)
+        for block in m.mode_blocks["image"]:
+            hidden_states = block(hidden_states, image_early_mod, image_rotary_emb)
+        for block in m.mode_blocks["image_cond"]:
+            image_cond_hidden_states = block(image_cond_hidden_states, cond_early_mod, cond_rotary_emb)
+
+        content_states = torch.cat([hidden_states, image_cond_hidden_states], dim=1)
+        content_mod = torch.cat([image_single_mod, cond_single_mod], dim=1)
+        joint_rotary_emb = (
+            torch.cat([txt_rotary_emb[0], image_rotary_emb[0], cond_rotary_emb[0]], dim=0),
+            torch.cat([txt_rotary_emb[1], image_rotary_emb[1], cond_rotary_emb[1]], dim=0),
+        )
+        for block in m.single_transformer_blocks:
+            encoder_hidden_states, content_states = block(
+                hidden_states=content_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_mod=content_mod,
+                temb_mod_context=txt_single_mod,
+                image_rotary_emb=joint_rotary_emb,
+            )
+        hidden_states = content_states[:, :image_seq_len]
+        hidden_states = m.norm_out(hidden_states, image_temb)
+        return cast(torch.Tensor, m.proj_out(hidden_states))
+
+
 class Flux3TextEncoderWrapper(torch.nn.Module):
     """Runs Qwen3-VL's language model up to the last stacked layer and stacks the hidden states.
 
@@ -229,6 +306,32 @@ def flux3_transformer_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
     windows = torch.export.Dim("text_windows", min=1, max=MAX_TEXT_WINDOWS)
     text_len = TEXT_PAD_MULTIPLE * windows
     return (None, {1: text_len}, None, None, None, {0: text_len})
+
+
+def reference_position_ids(grids: list[tuple[int, int]]) -> torch.Tensor:
+    """`[sum(h*w), 4]` ids for references with these latent grids, in order: each its own grid
+    from (0, 0), told apart on the last axis (-1, -2, …), as diffusers packs them."""
+    return torch.cat([image_position_ids(h, w, l_coord=-(1 + index)) for index, (h, w) in enumerate(grids)], dim=0)
+
+
+def dummy_flux3_transformer_image_cond(
+    pipe: Any, grid_h: int = 64, grid_w: int = 64, cond_grids: tuple[tuple[int, int], ...] = ((64, 64),),
+    text_seq_len: int = 160,
+) -> tuple[torch.Tensor, ...]:
+    """Text-to-image inputs plus reference tokens filling `cond_grids` (one 64 × 64 grid: one
+    1024² reference, or the same 4096 tokens shared by several)."""
+    cfg = pipe.transformer.config
+    dtype = next(pipe.transformer.parameters()).dtype
+    cond_len = sum(h * w for h, w in cond_grids)
+    return dummy_flux3_transformer(pipe, grid_h, grid_w, text_seq_len) + (
+        torch.randn(1, cond_len, cfg.cond_in_channels, dtype=dtype),
+        reference_position_ids(list(cond_grids)),
+    )
+
+
+def flux3_transformer_image_cond_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
+    """The text window is dynamic as in text-to-image; the reference tokens are a fixed length."""
+    return flux3_transformer_dynamic_shapes() + (None, None)
 
 
 def dummy_flux3_text_encoder(pipe: Any, text_seq_len: int = 160) -> tuple[torch.Tensor, ...]:

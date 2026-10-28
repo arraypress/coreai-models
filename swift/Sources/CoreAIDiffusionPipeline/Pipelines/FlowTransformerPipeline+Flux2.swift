@@ -390,7 +390,10 @@ extension FlowTransformerPipeline {
     // MARK: - Img2Img
 
     /// Encode a reference image into packed latent tokens (no noise blending).
-    private func encodeReferenceImage(
+    /// One reference picture at the full latent grid: resized, encoded, patchified,
+    /// batch-norm normalized and packed — `[rows*cols, inChannels]`. FLUX.3 shares it:
+    /// diffusers' `Flux3VaeEncoderStep` does the same (the VAE's mode, patchify, BN).
+    func encodeReferenceImage(
         encoder: CoreAIDiffusionModelFunction,
         srcImage: CGImage,
         rows: Int,
