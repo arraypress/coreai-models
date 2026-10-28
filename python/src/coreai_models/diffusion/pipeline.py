@@ -564,4 +564,26 @@ def _quantize_component_weights(
         0,  # cache_seq_len: no KV cache
         (),  # state_indices: no states to reset between samples
     )
+    _widen_bfloat16_block_scales(wrapper)
     quantized_modules.add(id(weight_owner))
+
+
+def _widen_bfloat16_block_scales(wrapper: torch.nn.Module) -> None:
+    """Store per-block weight scales as float32 when the model computes in bfloat16.
+
+    Core AI's GPU quantized matmul accepts only half or float scales and aborts on bfloat16
+    (`MPSNDArrayQuantizedMatrixMultiplication`: "scale should be half or float"). An integer
+    dequantize returns the scale's dtype, so the weight is cast back to bfloat16 after it.
+    Every bfloat16 value is exact in float32, so the weights do not change. Per-channel
+    scales are left alone: that kernel takes bfloat16.
+    """
+    for module in wrapper.modules():
+        scale = getattr(module, "scale", None)
+        if not isinstance(scale, torch.Tensor) or scale.dtype != torch.bfloat16:
+            continue
+        data = getattr(module, "quantized_data", None)
+        if data is None or data.is_floating_point() or scale.dim() < 2 or scale.shape[-1] in (1, data.shape[-1]):
+            continue
+        module.scale = scale.to(torch.float32)
+        forward = module.forward
+        module.forward = lambda *args, _forward=forward: _forward(*args).to(torch.bfloat16)
