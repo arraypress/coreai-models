@@ -25,13 +25,17 @@ import Tokenizers
 extension FlowTransformerPipeline {
     // MARK: - Recipe Constants
 
-    private static let flux3PatchSize = 16
+    static let flux3PatchSize = 16
+    /// The most pixels a FLUX.3 picture holds: 4 megapixels, diffusers' bound (2048 × 2048).
+    static let flux3MaximumPixels = 2048 * 2048
+    /// The most reference pictures FLUX.3 takes in one edit (diffusers' bound).
+    static let flux3MaximumReferences = 10
     private static let flux3LatentChannels = 128
     static let flux3TextPadMultiple = 80
     static let flux3MaxTextWindows = 13
     static let flux3ImageRopeScale: Float = 0.5
     static let flux3TimestepShift: Float = 6.93
-    private static let flux3AxisCount = 4
+    static let flux3AxisCount = 4
 
     // MARK: - Denoising Plan
 
@@ -43,9 +47,16 @@ extension FlowTransformerPipeline {
         if configuration.lazyModelLoading { await textEncoder.unloadResources() }
         let textDim = textEmbeddings.count / textSeqLen
 
-        // 2. Latent grid from the exported image size.
-        let rows = defaultImageSize.height / Self.flux3PatchSize
-        let cols = defaultImageSize.width / Self.flux3PatchSize
+        // 2. Latent grid: the size asked for (the export's image length is variable), else the export's.
+        let width = configuration.imageWidth ?? defaultImageSize.width
+        let height = configuration.imageHeight ?? defaultImageSize.height
+        guard width % Self.flux3PatchSize == 0, height % Self.flux3PatchSize == 0, width > 0, height > 0,
+              width * height <= Self.flux3MaximumPixels else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "FLUX.3 draws sides in multiples of \(Self.flux3PatchSize) up to \(Self.flux3MaximumPixels) pixels in all; asked for \(width) × \(height)")
+        }
+        let rows = height / Self.flux3PatchSize
+        let cols = width / Self.flux3PatchSize
         let inChannels = Self.flux3LatentChannels
         let seqLen = rows * cols
 
@@ -119,17 +130,10 @@ extension FlowTransformerPipeline {
 
     /// The reference tokens of an edit and their position ids, or nil without references.
     ///
-    /// The editing transformer is traced with one full grid of reference tokens, dealt out in
-    /// four quarter slots as FLUX.2's are (two references get two slots each, the first of
-    /// three gets two). What fills a slot keeps the reference at its full size, because a
-    /// reference whose positions span half the grid is read as a half-size picture: measured,
-    /// a person dressed from quarter grids came out drawn smaller than in her photo.
-    /// - A reference with several slots carries that many exact phases of its full-resolution
-    ///   tokens — every other row and column, at offsets (0, 0), (1, 1), (0, 1), (1, 0) — each
-    ///   token at its true position. Attention reads keys by position, not order, so one
-    ///   reference is exactly its full grid, as diffusers passes it.
-    /// - A reference with one slot carries its 2 × 2 block means, each at the block's centre.
-    /// Positions are diffusers' FLUX.3 ids: scaled by 0.5, l = −1, −2, … by reference.
+    /// As diffusers' FLUX.3 pipeline passes them: every reference its own full grid, one
+    /// after another — the edited picture at the picture's own grid, every further one fitted
+    /// under 1 megapixel at its own shape — each grid from (0, 0) with l = −1, −2, … The
+    /// editor's reference length is variable, so any number fits, up to diffusers' ten.
     func flux3References(
         _ configuration: PipelineConfiguration, rows: Int, cols: Int, inChannels: Int
     ) async throws -> (tokens: [Float], ids: [Float], count: Int)? {
@@ -138,60 +142,31 @@ extension FlowTransformerPipeline {
         guard let encoder else {
             throw PipelineLoadError.unsupportedConfiguration("this FLUX.3 bundle has no VAE encoder to read references with.")
         }
-        guard references.count <= Self.maxReferenceImages else {
+        guard references.count <= Self.flux3MaximumReferences else {
             throw PipelineLoadError.unsupportedConfiguration(
-                "FLUX.3 takes at most \(Self.maxReferenceImages) reference images here; got \(references.count).")
+                "FLUX.3 takes at most \(Self.flux3MaximumReferences) reference images; got \(references.count).")
         }
-        var encoded: [[Float]] = []
-        for image in references {
-            encoded.append(try await encodeReferenceImage(
-                encoder: encoder, srcImage: image, rows: rows, cols: cols, inChannels: inChannels))
-        }
-        if configuration.lazyModelLoading { await encoder.unloadResources() }
-
-        let slots = Self.referenceSlots(count: encoded.count)
         var tokens: [Float] = []
         var ids: [Float] = []
-        for layout in Self.flux3SlotLayout(slots: slots) {
-            let full = encoded[layout.reference]
-            let l = -Float(1 + layout.reference)
-            if let (py, px) = layout.phase {
-                for h in 0..<rows / 2 {
-                    for w in 0..<cols / 2 {
-                        let (y, x) = (2 * h + py, 2 * w + px)
-                        let base = (y * cols + x) * inChannels
-                        tokens.append(contentsOf: full[base..<base + inChannels])
-                        ids.append(contentsOf: Self.flux3Id(row: Float(y), col: Float(x), l: l))
-                    }
-                }
-            } else {
-                tokens.append(contentsOf: Self.subsampleTokens(
-                    full, fromRows: rows, fromCols: cols, toRows: rows / 2, toCols: cols / 2, channels: inChannels))
-                for h in 0..<rows / 2 {
-                    for w in 0..<cols / 2 {
-                        ids.append(contentsOf: Self.flux3Id(row: 2 * Float(h) + 0.5, col: 2 * Float(w) + 0.5, l: l))
-                    }
-                }
-            }
+        for (index, image) in references.enumerated() {
+            let grid = index == 0 && configuration.startingImage != nil
+                ? (rows: rows, cols: cols) : Self.flux3ReferenceGrid(width: image.width, height: image.height)
+            let fitted = CGImageUtils.centreCropped(image, aspectWidth: grid.cols, aspectHeight: grid.rows) ?? image
+            tokens.append(contentsOf: try await encodeReferenceImage(
+                encoder: encoder, srcImage: fitted, rows: grid.rows, cols: grid.cols, inChannels: inChannels))
+            ids.append(contentsOf: Self.flux3ImageIds(rows: grid.rows, cols: grid.cols, lCoord: -Float(1 + index)))
         }
-        return (tokens, ids, slots.count * (rows / 2) * (cols / 2))
+        if configuration.lazyModelLoading { await encoder.unloadResources() }
+        return (tokens, ids, ids.count / Self.flux3AxisCount)
     }
 
-    /// What fills each quarter slot: a phase of its reference when the reference has several
-    /// slots (in the order (0, 0), (1, 1), (0, 1), (1, 0)), its block means when it has one.
-    static func flux3SlotLayout(slots: [Int]) -> [(reference: Int, phase: (Int, Int)?)] {
-        let phases = [(0, 0), (1, 1), (0, 1), (1, 0)]
-        var used: [Int: Int] = [:]
-        return slots.map { reference in
-            let count = slots.filter { $0 == reference }.count
-            defer { used[reference, default: 0] += 1 }
-            return (reference, count > 1 ? phases[used[reference, default: 0]] : nil)
-        }
-    }
-
-    /// One token's position id: (t, h, w, l), h and w scaled by 0.5.
-    static func flux3Id(row: Float, col: Float, l: Float) -> [Float] {
-        [0, row * flux3ImageRopeScale, col * flux3ImageRopeScale, l]
+    /// A reference's latent grid in diffusers' multi-reference mode: the picture downscaled to
+    /// fit under 1 megapixel (never up), its sides cut down to multiples of 16 pixels.
+    static func flux3ReferenceGrid(width: Int, height: Int, maximumPixels: Double = 1_048_576) -> (rows: Int, cols: Int) {
+        let scale = min(1, (maximumPixels / Double(width * height)).squareRoot())
+        let cols = max(1, Int(Double(width) * scale) / flux3PatchSize)
+        let rows = max(1, Int(Double(height) * scale) / flux3PatchSize)
+        return (rows, cols)
     }
 
     // MARK: - Schedule

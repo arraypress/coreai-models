@@ -91,6 +91,10 @@ public struct PipelineConfiguration: Hashable, Sendable {
     /// Load model components on demand and unload after each pipeline stage to reduce peak memory.
     /// Disable to keep all models resident and exercise full memory pressure (e.g. profiling peak footprint).
     public var lazyModelLoading: Bool
+    /// The picture's width and height, for an export whose image length is variable
+    /// (FLUX.3); nil takes the export's own size.
+    public var imageWidth: Int?
+    public var imageHeight: Int?
 
     public init(
         prompt: String,
@@ -109,7 +113,9 @@ public struct PipelineConfiguration: Hashable, Sendable {
         decodeResolution: DecodeResolution = .full,
         lazyModelLoading: Bool = true,
         additionalReferences: [CGImage] = [],
-        transformerInputs: [String: NDArray] = [:]
+        transformerInputs: [String: NDArray] = [:],
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -127,6 +133,8 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.decodeResolution = decodeResolution
         self.lazyModelLoading = lazyModelLoading
         self.additionalReferences = additionalReferences
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
         self.transformerInputs = transformerInputs
     }
 
@@ -155,6 +163,8 @@ extension PipelineConfiguration {
         hasher.combine(lazyModelLoading)
         hasher.combine(additionalReferences.count)
         hasher.combine(transformerInputs.keys.sorted())
+        hasher.combine(imageWidth)
+        hasher.combine(imageHeight)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -174,5 +184,7 @@ extension PipelineConfiguration {
             && lhs.lazyModelLoading == rhs.lazyModelLoading
             && lhs.additionalReferences.count == rhs.additionalReferences.count
             && lhs.transformerInputs.keys.sorted() == rhs.transformerInputs.keys.sorted()
+            && lhs.imageWidth == rhs.imageWidth
+            && lhs.imageHeight == rhs.imageHeight
     }
 }

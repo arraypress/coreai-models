@@ -32,6 +32,18 @@ public enum CGImageUtils {
     ///
     /// Renders into an sRGB RGBA8 context, then vectorizes UInt8→Float32 and applies
     /// (pixel / 127.5) − 1.0 for all three channels in a single vDSP pass.
+    /// The largest centred crop of `image` with the aspect `aspectWidth : aspectHeight`, or
+    /// nil when it cannot be cut.
+    public static func centreCropped(_ image: CGImage, aspectWidth: Int, aspectHeight: Int) -> CGImage? {
+        guard aspectWidth > 0, aspectHeight > 0 else { return nil }
+        let target = Double(aspectWidth) / Double(aspectHeight)
+        let width = Double(image.width), height = Double(image.height)
+        let cropWidth = min(width, height * target), cropHeight = min(height, width / target)
+        let rect = CGRect(x: ((width - cropWidth) / 2).rounded(), y: ((height - cropHeight) / 2).rounded(),
+                          width: cropWidth.rounded(), height: cropHeight.rounded())
+        return image.cropping(to: rect)
+    }
+
     public static func toNormalizedPlanarRGB(_ image: CGImage) throws -> [Float] {
         let width = image.width
         let height = image.height

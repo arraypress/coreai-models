@@ -243,8 +243,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
         if configuration.lazyModelLoading { await decoder.unloadResources() }
 
+        // The run's own size when it asked for one (FLUX.3 draws any), else the export's.
         let image = try DiffusionUtilities.pixelsToCGImage(
-            pixels, height: defaultImageSize.height, width: defaultImageSize.width)
+            pixels, height: configuration.imageHeight ?? defaultImageSize.height,
+            width: configuration.imageWidth ?? defaultImageSize.width)
 
         var latentsND = NDArray(shape: plan.noiseShape, scalarType: .float32)
         let latentsView = latentsND.mutableView(as: Float.self)

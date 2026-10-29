@@ -47,24 +47,13 @@ struct Flux3RecipeTests {
         #expect(FlowTransformerPipeline.flux3TextIds(textSeqLen: 3) == [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2])
     }
 
-    @Test("Reference slots: phases for a reference with several, block means for one; one reference is its full grid")
-    func referenceLayout() {
-        let one = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 1))
-        #expect(one.map(\.reference) == [0, 0, 0, 0])
-        // Every full-grid position exactly once across the four phases.
-        var covered = Set<[Int]>()
-        for slot in one {
-            let (py, px) = slot.phase!
-            for h in 0..<3 { for w in 0..<4 { covered.insert([2 * h + py, 2 * w + px]) } }
-        }
-        #expect(covered.count == 6 * 8, "four phases of a 6 × 8 grid are the grid")
-        let two = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 2))
-        #expect(two.map(\.reference) == [0, 1, 0, 1])
-        #expect(two[0].phase! == (0, 0) && two[2].phase! == (1, 1), "a reference's two slots are two different phases")
-        let three = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 3))
-        #expect(three.map(\.reference) == [0, 1, 2, 0])
-        #expect(three[1].phase == nil && three[2].phase == nil, "one slot: block means")
-        #expect(three[0].phase != nil && three[3].phase != nil)
-        #expect(FlowTransformerPipeline.flux3Id(row: 2.5, col: 4, l: -2) == [0, 1.25, 2, -2], "block centres scale like any position")
+    @Test("A further reference is fitted under 1 megapixel at its own shape, never enlarged")
+    func referenceGrid() {
+        #expect(FlowTransformerPipeline.flux3ReferenceGrid(width: 1024, height: 1024) == (64, 64))
+        let phone = FlowTransformerPipeline.flux3ReferenceGrid(width: 4032, height: 3024)
+        #expect(phone.rows == 55 && phone.cols == 73, "4:3 kept, under 1 megapixel: \(phone)")
+        #expect(phone.rows * phone.cols * 256 <= 1_048_576)
+        #expect(FlowTransformerPipeline.flux3ReferenceGrid(width: 512, height: 768) == (48, 32), "a small picture is not enlarged")
+        #expect(FlowTransformerPipeline.flux3MaximumReferences == 10 && FlowTransformerPipeline.flux3MaximumPixels == 2048 * 2048)
     }
 }
