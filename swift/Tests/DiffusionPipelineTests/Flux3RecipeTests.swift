@@ -47,17 +47,24 @@ struct Flux3RecipeTests {
         #expect(FlowTransformerPipeline.flux3TextIds(textSeqLen: 3) == [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2])
     }
 
-    @Test("References dealt into quarters keep their own grid and their own l; one reference's slots match")
-    func referenceIds() {
-        // Two references: slots 0, 1, 0, 1 — four quarter grids of 1 × 2.
-        let slots = FlowTransformerPipeline.referenceSlots(count: 2)
-        #expect(slots == [0, 1, 0, 1])
-        let ids = FlowTransformerPipeline.flux3ReferenceIds(slots: slots, slotRows: 1, slotCols: 2)
-        #expect(ids.count == 4 * 2 * 4)
-        let slot = { (index: Int) in Array(ids[index * 8..<index * 8 + 8]) }
-        #expect(slot(0) == [0, 0, 0, -1, 0, 0, 0.5, -1], "each slot starts its grid at (0, 0)")
-        #expect(slot(1) == [0, 0, 0, -2, 0, 0, 0.5, -2], "the second reference is l = -2")
-        #expect(slot(2) == slot(0) && slot(3) == slot(1), "a reference's two slots carry identical ids")
-        #expect(FlowTransformerPipeline.referenceSlots(count: 3) == [0, 1, 2, 0], "the first of three gets two")
+    @Test("Reference slots: phases for a reference with several, block means for one; one reference is its full grid")
+    func referenceLayout() {
+        let one = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 1))
+        #expect(one.map(\.reference) == [0, 0, 0, 0])
+        // Every full-grid position exactly once across the four phases.
+        var covered = Set<[Int]>()
+        for slot in one {
+            let (py, px) = slot.phase!
+            for h in 0..<3 { for w in 0..<4 { covered.insert([2 * h + py, 2 * w + px]) } }
+        }
+        #expect(covered.count == 6 * 8, "four phases of a 6 × 8 grid are the grid")
+        let two = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 2))
+        #expect(two.map(\.reference) == [0, 1, 0, 1])
+        #expect(two[0].phase! == (0, 0) && two[2].phase! == (1, 1), "a reference's two slots are two different phases")
+        let three = FlowTransformerPipeline.flux3SlotLayout(slots: FlowTransformerPipeline.referenceSlots(count: 3))
+        #expect(three.map(\.reference) == [0, 1, 2, 0])
+        #expect(three[1].phase == nil && three[2].phase == nil, "one slot: block means")
+        #expect(three[0].phase != nil && three[3].phase != nil)
+        #expect(FlowTransformerPipeline.flux3Id(row: 2.5, col: 4, l: -2) == [0, 1.25, 2, -2], "block centres scale like any position")
     }
 }

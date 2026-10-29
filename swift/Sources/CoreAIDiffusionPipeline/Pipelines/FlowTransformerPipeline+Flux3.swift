@@ -119,12 +119,17 @@ extension FlowTransformerPipeline {
 
     /// The reference tokens of an edit and their position ids, or nil without references.
     ///
-    /// The editing transformer is traced with one full grid of reference tokens. One
-    /// reference fills it. Several share it as FLUX.2's do: each is encoded at the full
-    /// grid and area-averaged to a quarter, and the four quarters are dealt out in turn
-    /// (two references get two each, the first of three gets two). Each reference keeps
-    /// diffusers' FLUX.3 ids — its own grid from (0, 0), told apart by l = −1, −2, … — so
-    /// the slots of one reference carry identical ids.
+    /// The editing transformer is traced with one full grid of reference tokens, dealt out in
+    /// four quarter slots as FLUX.2's are (two references get two slots each, the first of
+    /// three gets two). What fills a slot keeps the reference at its full size, because a
+    /// reference whose positions span half the grid is read as a half-size picture: measured,
+    /// a person dressed from quarter grids came out drawn smaller than in her photo.
+    /// - A reference with several slots carries that many exact phases of its full-resolution
+    ///   tokens — every other row and column, at offsets (0, 0), (1, 1), (0, 1), (1, 0) — each
+    ///   token at its true position. Attention reads keys by position, not order, so one
+    ///   reference is exactly its full grid, as diffusers passes it.
+    /// - A reference with one slot carries its 2 × 2 block means, each at the block's centre.
+    /// Positions are diffusers' FLUX.3 ids: scaled by 0.5, l = −1, −2, … by reference.
     func flux3References(
         _ configuration: PipelineConfiguration, rows: Int, cols: Int, inChannels: Int
     ) async throws -> (tokens: [Float], ids: [Float], count: Int)? {
@@ -143,23 +148,50 @@ extension FlowTransformerPipeline {
                 encoder: encoder, srcImage: image, rows: rows, cols: cols, inChannels: inChannels))
         }
         if configuration.lazyModelLoading { await encoder.unloadResources() }
-        if encoded.count == 1 {
-            return (encoded[0], Self.flux3ImageIds(rows: rows, cols: cols, lCoord: -1), rows * cols)
-        }
-        let (slotRows, slotCols) = (rows / 2, cols / 2)
-        let quarters = encoded.map {
-            Self.subsampleTokens($0, fromRows: rows, fromCols: cols, toRows: slotRows, toCols: slotCols, channels: inChannels)
-        }
+
         let slots = Self.referenceSlots(count: encoded.count)
-        return (slots.flatMap { quarters[$0] },
-                Self.flux3ReferenceIds(slots: slots, slotRows: slotRows, slotCols: slotCols),
-                slots.count * slotRows * slotCols)
+        var tokens: [Float] = []
+        var ids: [Float] = []
+        for layout in Self.flux3SlotLayout(slots: slots) {
+            let full = encoded[layout.reference]
+            let l = -Float(1 + layout.reference)
+            if let (py, px) = layout.phase {
+                for h in 0..<rows / 2 {
+                    for w in 0..<cols / 2 {
+                        let (y, x) = (2 * h + py, 2 * w + px)
+                        let base = (y * cols + x) * inChannels
+                        tokens.append(contentsOf: full[base..<base + inChannels])
+                        ids.append(contentsOf: Self.flux3Id(row: Float(y), col: Float(x), l: l))
+                    }
+                }
+            } else {
+                tokens.append(contentsOf: Self.subsampleTokens(
+                    full, fromRows: rows, fromCols: cols, toRows: rows / 2, toCols: cols / 2, channels: inChannels))
+                for h in 0..<rows / 2 {
+                    for w in 0..<cols / 2 {
+                        ids.append(contentsOf: Self.flux3Id(row: 2 * Float(h) + 0.5, col: 2 * Float(w) + 0.5, l: l))
+                    }
+                }
+            }
+        }
+        return (tokens, ids, slots.count * (rows / 2) * (cols / 2))
     }
 
-    /// Position ids for references dealt into quarter slots: each slot its reference's grid
-    /// from (0, 0) with l = −(1 + reference).
-    static func flux3ReferenceIds(slots: [Int], slotRows: Int, slotCols: Int) -> [Float] {
-        slots.flatMap { flux3ImageIds(rows: slotRows, cols: slotCols, lCoord: -Float(1 + $0)) }
+    /// What fills each quarter slot: a phase of its reference when the reference has several
+    /// slots (in the order (0, 0), (1, 1), (0, 1), (1, 0)), its block means when it has one.
+    static func flux3SlotLayout(slots: [Int]) -> [(reference: Int, phase: (Int, Int)?)] {
+        let phases = [(0, 0), (1, 1), (0, 1), (1, 0)]
+        var used: [Int: Int] = [:]
+        return slots.map { reference in
+            let count = slots.filter { $0 == reference }.count
+            defer { used[reference, default: 0] += 1 }
+            return (reference, count > 1 ? phases[used[reference, default: 0]] : nil)
+        }
+    }
+
+    /// One token's position id: (t, h, w, l), h and w scaled by 0.5.
+    static func flux3Id(row: Float, col: Float, l: Float) -> [Float] {
+        [0, row * flux3ImageRopeScale, col * flux3ImageRopeScale, l]
     }
 
     // MARK: - Schedule
@@ -195,8 +227,13 @@ extension FlowTransformerPipeline {
         let messages: [[String: String]] = [["role": "user", "content": text]]
         var ids = try tokenizer.applyChatTemplate(
             messages: messages, chatTemplate: nil, addGenerationPrompt: true,
-            truncation: true, maxLength: maxWindow, tools: nil, additionalContext: nil)
-        if ids.count > maxWindow { ids = Array(ids.prefix(maxWindow)) }
+            truncation: false, maxLength: nil, tools: nil, additionalContext: nil)
+        // Refused, never cut: an edit record past the window would lose the end of its box
+        // table without a word, and the picture would quietly ignore what it said.
+        guard ids.count <= maxWindow else {
+            throw PipelineLoadError.unsupportedConfiguration(
+                "the prompt is \(ids.count) tokens with its chat template; FLUX.3 reads at most \(maxWindow)")
+        }
 
         let realTokens = ids.count
         let window = Self.flux3TextWindow(tokens: realTokens)
