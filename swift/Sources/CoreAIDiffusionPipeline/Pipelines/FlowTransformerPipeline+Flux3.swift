@@ -26,8 +26,20 @@ extension FlowTransformerPipeline {
     // MARK: - Recipe Constants
 
     static let flux3PatchSize = 16
-    /// The most pixels a FLUX.3 picture holds: 4 megapixels, diffusers' bound (2048 × 2048).
-    static let flux3MaximumPixels = 2048 * 2048
+    /// The most pixels a FLUX.3 picture holds: 3840 × 2160 (8.3 megapixels), the largest
+    /// measured — 18 minutes on a 36 GB Mac (BFL: "native 4K generation").
+    static let flux3MaximumPixels = 3840 * 2160
+
+    /// The longest side a FLUX.3 picture may have: the exports' VAE takes up to 4096.
+    static let flux3MaximumSide = 4096
+
+    /// Whether FLUX.3 draws `width` × `height`: sides in multiples of 16 up to
+    /// ``flux3MaximumSide``, at most ``flux3MaximumPixels`` in all.
+    static func isFlux3Size(width: Int, height: Int) -> Bool {
+        width > 0 && height > 0 && width % flux3PatchSize == 0 && height % flux3PatchSize == 0
+            && width <= flux3MaximumSide && height <= flux3MaximumSide && width * height <= flux3MaximumPixels
+    }
+
     /// The most reference pictures FLUX.3 takes in one edit (diffusers' bound).
     static let flux3MaximumReferences = 10
     private static let flux3LatentChannels = 128
@@ -50,10 +62,10 @@ extension FlowTransformerPipeline {
         // 2. Latent grid: the size asked for (the export's image length is variable), else the export's.
         let width = configuration.imageWidth ?? defaultImageSize.width
         let height = configuration.imageHeight ?? defaultImageSize.height
-        guard width % Self.flux3PatchSize == 0, height % Self.flux3PatchSize == 0, width > 0, height > 0,
-              width * height <= Self.flux3MaximumPixels else {
+        guard Self.isFlux3Size(width: width, height: height) else {
             throw PipelineLoadError.unsupportedConfiguration(
-                "FLUX.3 draws sides in multiples of \(Self.flux3PatchSize) up to \(Self.flux3MaximumPixels) pixels in all; asked for \(width) × \(height)")
+                "FLUX.3 draws sides in multiples of \(Self.flux3PatchSize) up to \(Self.flux3MaximumSide), "
+                + "\(Self.flux3MaximumPixels) pixels in all (3840 × 2160); asked for \(width) × \(height)")
         }
         let rows = height / Self.flux3PatchSize
         let cols = width / Self.flux3PatchSize
@@ -104,7 +116,8 @@ extension FlowTransformerPipeline {
                 inputs.append((reference.tokens, [1, reference.count, inChannels]))
                 inputs.append((reference.ids, [reference.count, axisCount]))
             }
-            return try await denoiser.run(floatInputs: inputs, functionName: fnName, namedInputs: [:])
+            // A slot export's LoRA matrices (a trained person); a plain export ignores names it does not declare.
+            return try await denoiser.run(floatInputs: inputs, functionName: fnName, namedInputs: configuration.transformerInputs)
         }
 
         // Unpack → BN denorm → unpatchify: (1, rows*cols, 128) → (1, 32, rows*2, cols*2).

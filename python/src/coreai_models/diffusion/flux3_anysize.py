@@ -1,18 +1,19 @@
-"""FLUX.3 [klein] at any size: every length variable, from one load (and, for 4-bit, one quantization).
+"""FLUX.3 [klein] at any size up to 4K: every length variable, from one load (and, for 4-bit, one quantization).
 
     python -m coreai_models.diffusion.flux3_anysize BUNDLE [--compression 4bit]
 
 `BUNDLE` is a finished FLUX.3 export (its `metadata.json`, tokenizer, batch-norm statistics and text
 encoder are kept). Beside them this writes:
 
-- `Transformer_any.aimodel` — text to image, the image and text lengths variable;
+- `Transformer_4k.aimodel` — text to image, the image and text lengths variable;
 - `Transformer_img2img_full.aimodel` — editing, the image, text and reference lengths variable, so
   one editor takes any number of references, each at its own full grid, as diffusers does;
-- `VAEEncoder_any.aimodel`, `VAEDecoder_any.aimodel` — height and width variable, multiples of 16
-  up to 2048;
+- `VAEEncoder_4k.aimodel`, `VAEDecoder_4k.aimodel` — height and width variable, multiples of 16
+  up to 4096;
 
-and rewrites `metadata.json` to name them. Any shape, any size up to 4 megapixels, up to ten
-references. Measured: the variable transformer agrees with diffusers' forward to cosine 0.999912 on
+and rewrites `metadata.json` to name them. Any shape, sides up to 4096, up to ten references — the
+Swift pipeline allows 3840 × 2160 (8.3 megapixels), the largest measured: 18 minutes on a 36 GB Mac,
+its picture decoded in 1024-pixel tiles (one whole 3840 × 2160 decode alone took free memory to 4%). Measured: the variable transformer agrees with diffusers' forward to cosine 0.999912 on
 the saved reference inputs, exactly as the fixed 1:1 export does; the variable editor run at 1:1
 reproduced the fixed one bit for bit. Core AI compiles each variable function once for every size.
 """
@@ -36,11 +37,13 @@ logger = logging.getLogger(__name__)
 MODEL_ID = "black-forest-labs/flux-3-image-klein"
 TRANSFORMER_INPUTS = ("hidden_states", "encoder_hidden_states", "timestep", "target_timestep", "img_ids", "txt_ids")
 EDIT_INPUTS = TRANSFORMER_INPUTS + ("image_cond_hidden_states", "image_cond_ids")
-ASSETS = {"transformer": "Transformer_any.aimodel", "text_encoder": "TextEncoder.aimodel",
-          "vae_decoder": "VAEDecoder_any.aimodel", "vae_encoder": "VAEEncoder_any.aimodel"}
+ASSETS = {"transformer": "Transformer_4k.aimodel", "text_encoder": "TextEncoder.aimodel",
+          "vae_decoder": "VAEDecoder_4k.aimodel", "vae_encoder": "VAEEncoder_4k.aimodel"}
 EDITOR = "Transformer_img2img_full.aimodel"
-# 4 megapixels (2048²) of image tokens; ten 1-megapixel references.
-MAX_IMAGE_TOKENS = 16384
+# 4096 × 4096 of image tokens (the pipeline allows 3840 × 2160); ten 1-megapixel references.
+MAX_IMAGE_TOKENS = 65536
+# The VAE's sides, in 16-pixel units: 4096 pixels.
+MAX_SIDE_UNITS = 256
 MAX_REFERENCE_TOKENS = 10 * 4096
 
 
@@ -98,10 +101,10 @@ def main() -> None:
          ({1: image}, text[1], None, None, {0: image}, text[5]), ASSETS["transformer"], "Transformer")
     save(editor, edit_trace, EDIT_INPUTS, ("output",),
          ({1: image}, text[1], None, None, {0: image}, text[5], {1: cond}, {0: cond}), EDITOR, "Transformer")
-    h, w = torch.export.Dim("h16", min=1, max=128), torch.export.Dim("w16", min=1, max=128)
+    h, w = torch.export.Dim("h16", min=1, max=MAX_SIDE_UNITS), torch.export.Dim("w16", min=1, max=MAX_SIDE_UNITS)
     save(Flux2VAEEncoderWrapper(parts.vae).eval(), (torch.randn(1, 3, 1024, 768, dtype=dtype),), ("image",),
          ("latent_params",), ({2: 16 * h, 3: 16 * w},), ASSETS["vae_encoder"], "VAEEncoder")
-    hl, wl = torch.export.Dim("h2", min=1, max=128), torch.export.Dim("w2", min=1, max=128)
+    hl, wl = torch.export.Dim("h2", min=1, max=MAX_SIDE_UNITS), torch.export.Dim("w2", min=1, max=MAX_SIDE_UNITS)
     save(Flux2VAEDecoderWrapper(parts.vae).eval(),
          (torch.randn(1, parts.vae.config.latent_channels, 128, 96, dtype=dtype),), ("z",), ("image",),
          ({2: 2 * hl, 3: 2 * wl},), ASSETS["vae_decoder"], "VAEDecoder")

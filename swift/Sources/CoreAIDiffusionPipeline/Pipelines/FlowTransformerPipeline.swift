@@ -230,7 +230,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
         switch mode {
         case .full, .half:
-            pixels = try await decoder.run(floatInputs: [(vaeLatents, vaeShape)])
+            // Whole up to 4 megapixels; past that (FLUX.3 draws up to 4096 a side) in tiles.
+            pixels = try await decodeLarge(
+                latents: vaeLatents, channels: vaeShape[1], height: vaeShape[2], width: vaeShape[3],
+                scale: (configuration.imageHeight ?? defaultImageSize.height) / vaeShape[2], decoder: decoder)
 
         case .tiled:
             pixels = try await decodeTiled(

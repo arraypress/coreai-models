@@ -54,6 +54,12 @@ struct Flux3RecipeTests {
         #expect(phone.rows == 55 && phone.cols == 73, "4:3 kept, under 1 megapixel: \(phone)")
         #expect(phone.rows * phone.cols * 256 <= 1_048_576)
         #expect(FlowTransformerPipeline.flux3ReferenceGrid(width: 512, height: 768) == (48, 32), "a small picture is not enlarged")
-        #expect(FlowTransformerPipeline.flux3MaximumReferences == 10 && FlowTransformerPipeline.flux3MaximumPixels == 2048 * 2048)
+        #expect(FlowTransformerPipeline.flux3MaximumReferences == 10)
+        #expect(FlowTransformerPipeline.flux3MaximumPixels == 3840 * 2160 && FlowTransformerPipeline.flux3MaximumSide == 4096,
+                "4K, the largest measured")
+        #expect(FlowTransformerPipeline.isFlux3Size(width: 3840, height: 2160) && FlowTransformerPipeline.isFlux3Size(width: 2880, height: 2880))
+        #expect(!FlowTransformerPipeline.isFlux3Size(width: 4112, height: 512), "a side past 4096")
+        #expect(!FlowTransformerPipeline.isFlux3Size(width: 2896, height: 2896), "past 4K's pixels")
+        #expect(!FlowTransformerPipeline.isFlux3Size(width: 1000, height: 1008), "multiples of 16")
     }
 }
