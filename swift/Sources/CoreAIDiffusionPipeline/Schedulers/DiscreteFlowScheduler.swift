@@ -145,6 +145,36 @@ public final class DiscreteFlowScheduler {
         return prevSample
     }
 
+    /// The step the denoise loop starts at: 0, or later for strength img2img.
+    public private(set) var beginIndex = 0
+
+    /// Starts the schedule part-way through, as diffusers' `set_begin_index` does: the
+    /// next `step(...)` consumes `sigmas[index]`, so `currentSigma` is the noise level
+    /// the starting latents must be blended to.
+    public func setBeginIndex(_ index: Int) {
+        precondition(index >= 0 && index < inferenceStepCount, "begin index outside the schedule")
+        beginIndex = index
+        counter = index
+    }
+
+    /// How a strength below 1 maps onto a schedule that still runs `steps` model passes.
+    ///
+    /// diffusers' img2img (`FluxImg2ImgPipeline.get_timesteps`) skips the first
+    /// `steps − ⌊steps·strength⌋` steps of a `steps`-step schedule, which at FLUX.2 Klein's
+    /// four distilled steps quantises strength to quarters and leaves 0 < strength < 0.25
+    /// with nothing to run. So the schedule is re-spaced instead: a `total`-step schedule
+    /// with `total ≈ steps / strength`, entered at `total − steps`. That keeps the step
+    /// count the caller chose, makes every strength reachable, and lands on the same
+    /// starting point diffusers would for the strengths it can express.
+    ///
+    /// - Returns: `nil` when strength is 1 or more — the full schedule from pure noise.
+    public static func img2imgSchedule(steps: Int, strength: Float) -> (total: Int, begin: Int)? {
+        guard strength < 1, steps > 0 else { return nil }
+        let clamped = max(strength, 0.01)
+        let total = max(steps + 1, Int((Float(steps) / clamped).rounded()))
+        return (total, total - steps)
+    }
+
     public func calculateTimesteps(strength: Float?) -> [Int] {
         guard let strength else { return timeSteps }
         let startStep = max(inferenceStepCount - Int(Float(inferenceStepCount) * strength), 0)

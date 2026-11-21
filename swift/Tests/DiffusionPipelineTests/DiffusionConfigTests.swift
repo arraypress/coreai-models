@@ -25,6 +25,18 @@ struct DiffusionConfigTests {
         #expect(config.textDim == nil)
     }
 
+    @Test("A non-square export carries its width and height; a square one leaves them nil")
+    func decodesNonSquare() throws {
+        let wide = try decode(#"{"type": "flux2", "image_size": 1024, "image_width": 1344, "image_height": 768}"#)
+        #expect(wide.imageWidth == 1344)
+        #expect(wide.imageHeight == 768)
+        #expect(wide.imageSize == 1024)
+        let square = try decode(#"{"type": "flux2", "image_size": 1024}"#)
+        #expect(square.imageWidth == nil && square.imageHeight == nil)
+        let roundTrip = try decode(String(decoding: try JSONEncoder().encode(wide), as: UTF8.self))
+        #expect(roundTrip == wide)
+    }
+
     @Test("Decodes a FLUX.2 diffusion block")
     func decodesFlux2() throws {
         let config = try decode(

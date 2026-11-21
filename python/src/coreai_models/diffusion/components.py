@@ -19,6 +19,14 @@ from typing import Any, cast
 
 import torch
 
+from coreai_models.diffusion.flux3 import (
+    Flux3TextEncoderWrapper,
+    Flux3TransformerWrapper,
+    dummy_flux3_text_encoder_export,
+    dummy_flux3_transformer_export,
+    flux3_text_encoder_dynamic_shapes,
+    flux3_transformer_dynamic_shapes,
+)
 from coreai_models.diffusion.flux2 import (
     Flux2TextEncoderWrapper,
     Flux2TransformerWrapper,
@@ -368,6 +376,45 @@ FLUX2_COMPONENTS: dict[str, ComponentSpec] = {
 
 ALL_FLUX2_COMPONENTS: list[str] = list(FLUX2_COMPONENTS.keys())
 
+# FLUX.3 [klein]: the large parts load inside wrapper_fn (Flux3Parts), so the export loop
+# holds one at a time. The VAE is FLUX.2's, through FLUX.2's wrappers.
+FLUX3_COMPONENTS: dict[str, ComponentSpec | MultiFunctionComponentSpec] = {
+    "transformer": ComponentSpec(
+        asset_name="Transformer",
+        input_names=("hidden_states", "encoder_hidden_states", "timestep", "target_timestep", "img_ids", "txt_ids"),
+        output_names=("output",),
+        wrapper_fn=lambda p: Flux3TransformerWrapper(p.load_transformer()),
+        dummy_fn=dummy_flux3_transformer_export,
+        quantizable=True,
+        dynamic_shapes_fn=flux3_transformer_dynamic_shapes,
+    ),
+    "text_encoder": ComponentSpec(
+        asset_name="TextEncoder",
+        input_names=("input_ids", "attention_mask", "position_ids"),
+        output_names=("hidden_states",),
+        wrapper_fn=lambda p: Flux3TextEncoderWrapper(p.load_text_encoder()),
+        dummy_fn=dummy_flux3_text_encoder_export,
+        quantizable=True,
+        dynamic_shapes_fn=flux3_text_encoder_dynamic_shapes,
+    ),
+    "vae_decoder": ComponentSpec(
+        asset_name="VAEDecoder",
+        input_names=("z",),
+        output_names=("image",),
+        wrapper_fn=lambda p: Flux2VAEDecoderWrapper(p.vae),
+        dummy_fn=dummy_flux2_vae_decoder,
+    ),
+    "vae_encoder": ComponentSpec(
+        asset_name="VAEEncoder",
+        input_names=("image",),
+        output_names=("latent_params",),
+        wrapper_fn=lambda p: Flux2VAEEncoderWrapper(p.vae),
+        dummy_fn=dummy_flux2_vae_encoder,
+    ),
+}
+
+ALL_FLUX3_COMPONENTS: list[str] = list(FLUX3_COMPONENTS.keys())
+
 
 # Multi-function transformer: 8 functions in one .aimodel, shared weights (~2 GB)
 _FLUX2_TRANSFORMER_INPUT_NAMES = (
@@ -501,6 +548,8 @@ def get_component_registry(
         if multifunction:
             return FLUX2_MULTIFUNCTION_COMPONENTS
         return FLUX2_COMPONENTS
+    if pipeline_type == "flux3":
+        return FLUX3_COMPONENTS
     if pipeline_type == "wan":
         return WAN_COMPONENTS
     if pipeline_type == "sana_sprint":
@@ -514,6 +563,8 @@ def get_valid_components(pipeline_type: str, multifunction: bool = False) -> lis
         if multifunction:
             return ALL_FLUX2_MULTIFUNCTION_COMPONENTS
         return ALL_FLUX2_COMPONENTS
+    if pipeline_type == "flux3":
+        return ALL_FLUX3_COMPONENTS
     if pipeline_type == "wan":
         return ALL_WAN_COMPONENTS
     if pipeline_type == "sana_sprint":

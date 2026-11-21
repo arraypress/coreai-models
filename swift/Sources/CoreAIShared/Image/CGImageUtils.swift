@@ -31,15 +31,20 @@ public enum CGImageUtils {
 
     /// Resize a CGImage to `side × side` using CGContext with high-quality interpolation.
     public static func resize(_ image: CGImage, to side: Int) -> CGImage? {
+        resize(image, width: side, height: side)
+    }
+
+    /// Resize a CGImage to `width × height` (stretching; callers fit the aspect first).
+    public static func resize(_ image: CGImage, width: Int, height: Int) -> CGImage? {
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
             let ctx = CGContext(
-                data: nil, width: side, height: side,
-                bitsPerComponent: 8, bytesPerRow: 4 * side,
+                data: nil, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: 4 * width,
                 space: colorSpace,
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         else { return nil }
         ctx.interpolationQuality = .high
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: side, height: side))
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
         return ctx.makeImage()
     }
 
@@ -47,6 +52,18 @@ public enum CGImageUtils {
     ///
     /// Renders into an sRGB RGBA8 context, then vectorizes UInt8→Float32 and applies
     /// (pixel / 127.5) − 1.0 for all three channels in a single vDSP pass.
+    /// The largest centred crop of `image` with the aspect `aspectWidth : aspectHeight`, or
+    /// nil when it cannot be cut.
+    public static func centreCropped(_ image: CGImage, aspectWidth: Int, aspectHeight: Int) -> CGImage? {
+        guard aspectWidth > 0, aspectHeight > 0 else { return nil }
+        let target = Double(aspectWidth) / Double(aspectHeight)
+        let width = Double(image.width), height = Double(image.height)
+        let cropWidth = min(width, height * target), cropHeight = min(height, width / target)
+        let rect = CGRect(x: ((width - cropWidth) / 2).rounded(), y: ((height - cropHeight) / 2).rounded(),
+                          width: cropWidth.rounded(), height: cropHeight.rounded())
+        return image.cropping(to: rect)
+    }
+
     public static func toNormalizedPlanarRGB(_ image: CGImage) throws -> [Float] {
         let width = image.width
         let height = image.height

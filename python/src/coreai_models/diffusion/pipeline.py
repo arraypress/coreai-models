@@ -173,6 +173,10 @@ def export_diffusion(config: DiffusionExportConfig) -> dict[str, str]:
     # 3. Save sidecar assets (tokenizer, BN stats, etc.)
     if pipeline_type == "flux2":
         _save_flux2_sidecar_assets(hf_pipe, output_path, overwrite=config.overwrite)
+    if pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import save_flux3_sidecars
+
+        save_flux3_sidecars(hf_pipe, output_path, overwrite=config.overwrite)
     elif pipeline_type == "sana_sprint":
         _save_pipeline_tokenizer(hf_pipe, output_path, overwrite=config.overwrite)
     else:
@@ -211,6 +215,11 @@ def _load_hf_pipeline(model_id: str, pipeline_type: str, model_dtype: torch.dtyp
 
         hf_pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=model_dtype)
         return hf_pipe
+
+    if pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import Flux3Parts
+
+        return Flux3Parts(model_id, model_dtype)
 
     if pipeline_type == "sana_sprint":
         from diffusers import SanaSprintPipeline
@@ -373,6 +382,10 @@ def _write_metadata_json(
 
     if pipeline_type == "flux2":
         diffusion_config = _build_flux2_config(hf_pipe, model_id)
+    elif pipeline_type == "flux3":
+        from coreai_models.diffusion.flux3 import build_flux3_config
+
+        diffusion_config = build_flux3_config(hf_pipe)
     elif pipeline_type == "sana_sprint":
         diffusion_config = _build_sana_sprint_config(hf_pipe)
     elif pipeline_type == "wan":
@@ -551,4 +564,26 @@ def _quantize_component_weights(
         0,  # cache_seq_len: no KV cache
         (),  # state_indices: no states to reset between samples
     )
+    _widen_bfloat16_block_scales(wrapper)
     quantized_modules.add(id(weight_owner))
+
+
+def _widen_bfloat16_block_scales(wrapper: torch.nn.Module) -> None:
+    """Store per-block weight scales as float32 when the model computes in bfloat16.
+
+    Core AI's GPU quantized matmul accepts only half or float scales and aborts on bfloat16
+    (`MPSNDArrayQuantizedMatrixMultiplication`: "scale should be half or float"). An integer
+    dequantize returns the scale's dtype, so the weight is cast back to bfloat16 after it.
+    Every bfloat16 value is exact in float32, so the weights do not change. Per-channel
+    scales are left alone: that kernel takes bfloat16.
+    """
+    for module in wrapper.modules():
+        scale = getattr(module, "scale", None)
+        if not isinstance(scale, torch.Tensor) or scale.dtype != torch.bfloat16:
+            continue
+        data = getattr(module, "quantized_data", None)
+        if data is None or data.is_floating_point() or scale.dim() < 2 or scale.shape[-1] in (1, data.shape[-1]):
+            continue
+        module.scale = scale.to(torch.float32)
+        forward = module.forward
+        module.forward = lambda *args, _forward=forward: _forward(*args).to(torch.bfloat16)

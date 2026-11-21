@@ -1,0 +1,459 @@
+# Copyright 2026 Apple Inc.
+#
+# Use of this source code is governed by a BSD-3-clause license that can
+# be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
+
+"""
+FLUX.3 component specifications and torch wrappers for Core AI export.
+
+FLUX.3 [klein] is a DiT that uses:
+- a Qwen3-VL text encoder: hidden states of layers 4, 8, …, 32 stacked into 8 × 2560 = 20480
+  channels per token. Only its language model runs for a text prompt, and only up to layer 32,
+  so the export drops the vision tower, layers 33–36 and the output head.
+- per-mode blocks (5 for the image, 5 for the text, 5 for reference images) then 28 joint
+  blocks, with 4D RoPE over (t, h, w, l).
+- the FLUX.2 VAE (AutoencoderKLFlux2) unchanged.
+- a step-distilled "flow map": every step also embeds the timestep it jumps to
+  (`target_timestep`).
+
+Two things differ from FLUX.2 and are part of the model recipe, so the export keeps them:
+- the text window is the prompt's length rounded UP to a multiple of 80 tokens, and the
+  transformer attends to the padding. The text length is therefore a dynamic dimension in
+  steps of 80, not a fixed 512.
+- image position ids are scaled by 0.5 on the h and w axes (`IMAGE_ROPE_SCALE`); text tokens
+  carry their index on the last axis; padding tokens take position 1 inside Qwen3-VL, as in
+  the training environment (the runtime passes `position_ids`).
+"""
+
+from typing import Any, cast
+
+import torch
+
+# The recipe constants, from diffusers' modular FLUX.3 pipeline.
+TEXT_PAD_MULTIPLE = 80
+TEXT_ENCODER_LAYERS = (4, 8, 12, 16, 20, 24, 28, 32)
+IMAGE_ROPE_SCALE = 0.5
+TIMESTEP_SHIFT = 6.93
+
+# diffusers runs 16 steps; 4 measured as good on text, faces, hands and crowds, in a quarter of the time.
+DEFAULT_STEPS = 4
+
+# The longest text window exported: 13 × 80 = 1040 tokens (a full scene caption is 150–400).
+MAX_TEXT_WINDOWS = 13
+
+
+# ---------------------------------------------------------------------------
+# Torch wrappers
+# ---------------------------------------------------------------------------
+
+
+def _joint_block_forward(
+    self: torch.nn.Module,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    temb_mod: torch.Tensor,
+    temb_mod_context: torch.Tensor,
+    image_rotary_emb: tuple[torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flux3SingleTransformerBlock.forward with the text/content split taken from the content
+    end. diffusers splits at the text length, which is the dynamic dimension, and the Core AI
+    converter cannot split at a symbolic size; the content length is fixed by the image grid.
+    Same arithmetic, same result."""
+    mod_shift, mod_scale, mod_gate = torch.chunk(temb_mod, 3, dim=-1)
+    c_mod_shift, c_mod_scale, c_mod_gate = torch.chunk(temb_mod_context, 3, dim=-1)
+    norm_hidden_states = (1 + mod_scale) * self.norm(hidden_states) + mod_shift
+    norm_encoder_hidden_states = (1 + c_mod_scale) * self.norm(encoder_hidden_states) + c_mod_shift
+    combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+    output = self.attn(hidden_states=combined, image_rotary_emb=image_rotary_emb) + self.ff(combined)
+    content_len = hidden_states.shape[1]
+    context_output, content_output = output[:, :-content_len], output[:, -content_len:]
+    return encoder_hidden_states + c_mod_gate * context_output, hidden_states + mod_gate * content_output
+
+
+class Flux3TransformerWrapper(torch.nn.Module):
+    """FLUX.3 [klein] text-to-image for export: Flux3Transformer2DModel.forward without the
+    reference-image path, line for line, with two export changes that keep the arithmetic:
+
+    - the timestep embedding of 0 (what the text tokens are modulated by) is a constant, so it
+      is computed once and stored; diffusers builds it from `torch.zeros(..., dtype)`, a
+      `full` the Core AI converter types as float32 in a bfloat16 graph;
+    - the joint blocks take `_joint_block_forward` (the split at the content end), so the
+      dynamic text window exports.
+    """
+
+    def __init__(self, transformer: torch.nn.Module) -> None:
+        super().__init__()
+        import types
+
+        for block in transformer.single_transformer_blocks:
+            block.forward = types.MethodType(_joint_block_forward, block)
+        self.model = transformer
+        dtype = next(transformer.parameters()).dtype
+        with torch.no_grad():
+            zero = transformer.time_proj(torch.zeros(1, dtype=dtype))
+            self.register_buffer("zero_temb", transformer.timestep_embedder(zero.to(dtype))[:, None, :].clone())
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        target_timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        m = self.model
+        dtype = hidden_states.dtype
+        batch_size, image_seq_len = hidden_states.shape[:2]
+
+        image_temb = m.timestep_embedder(m.time_proj(timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        target_temb = m.target_timestep_embedder(m.time_proj(target_timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        image_temb = image_temb + target_temb
+        zero_temb = self.zero_temb.to(dtype) + target_temb
+        image_temb = image_temb.expand(batch_size, image_seq_len, -1)
+
+        zero_temb_act = torch.nn.functional.silu(zero_temb)
+        txt_temb_act = zero_temb_act.expand(batch_size, encoder_hidden_states.shape[1], -1)
+        txt_early_mod = m.early_stream_modulations["txt"](txt_temb_act)
+        txt_single_mod = m.single_stream_modulations["txt"](txt_temb_act)
+        encoder_hidden_states = m.context_embedder(encoder_hidden_states)
+        txt_rotary_emb = m.pos_embed(txt_ids)
+
+        image_temb_act = torch.nn.functional.silu(image_temb)
+        image_early_mod = m.early_stream_modulations["image"](image_temb_act)
+        image_single_mod = m.single_stream_modulations["image"](image_temb_act)
+        hidden_states = m.x_embedders["image"](hidden_states)
+        image_rotary_emb = m.pos_embed(img_ids)
+
+        for block in m.txt_mode_blocks:
+            encoder_hidden_states = block(encoder_hidden_states, txt_early_mod, txt_rotary_emb)
+        for block in m.mode_blocks["image"]:
+            hidden_states = block(hidden_states, image_early_mod, image_rotary_emb)
+
+        joint_rotary_emb = (
+            torch.cat([txt_rotary_emb[0], image_rotary_emb[0]], dim=0),
+            torch.cat([txt_rotary_emb[1], image_rotary_emb[1]], dim=0),
+        )
+        content_states = hidden_states
+        for block in m.single_transformer_blocks:
+            encoder_hidden_states, content_states = block(
+                hidden_states=content_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_mod=image_single_mod,
+                temb_mod_context=txt_single_mod,
+                image_rotary_emb=joint_rotary_emb,
+            )
+        hidden_states = content_states[:, :image_seq_len]
+        hidden_states = m.norm_out(hidden_states, image_temb)
+        return cast(torch.Tensor, m.proj_out(hidden_states))
+
+
+class Flux3ImageCondTransformerWrapper(Flux3TransformerWrapper):
+    """FLUX.3 [klein] with reference images (image-to-image) for export: diffusers'
+    Flux3Transformer2DModel.forward with `image_cond_hidden_states`, line for line, with the same
+    two export changes as `Flux3TransformerWrapper`.
+
+    The reference tokens are a fixed-length input (`cond_seq_len`), so the content the joint
+    blocks split off from the text is still fixed: image tokens, then reference tokens. Several
+    references share that length, told apart only by their position ids (`l` = -1, -2, …), which
+    the runtime passes in `image_cond_ids`.
+    """
+
+    def forward(  # type: ignore[override]
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.Tensor,
+        target_timestep: torch.Tensor,
+        img_ids: torch.Tensor,
+        txt_ids: torch.Tensor,
+        image_cond_hidden_states: torch.Tensor,
+        image_cond_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        m = self.model
+        dtype = hidden_states.dtype
+        batch_size, image_seq_len = hidden_states.shape[:2]
+
+        image_temb = m.timestep_embedder(m.time_proj(timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        target_temb = m.target_timestep_embedder(m.time_proj(target_timestep.to(dtype) * 1000).to(dtype))[:, None, :]
+        image_temb = image_temb + target_temb
+        zero_temb = self.zero_temb.to(dtype) + target_temb
+        image_temb = image_temb.expand(batch_size, image_seq_len, -1)
+        zero_temb_act = torch.nn.functional.silu(zero_temb)
+
+        txt_temb_act = zero_temb_act.expand(batch_size, encoder_hidden_states.shape[1], -1)
+        txt_early_mod = m.early_stream_modulations["txt"](txt_temb_act)
+        txt_single_mod = m.single_stream_modulations["txt"](txt_temb_act)
+        encoder_hidden_states = m.context_embedder(encoder_hidden_states)
+        txt_rotary_emb = m.pos_embed(txt_ids)
+
+        image_temb_act = torch.nn.functional.silu(image_temb)
+        image_early_mod = m.early_stream_modulations["image"](image_temb_act)
+        image_single_mod = m.single_stream_modulations["image"](image_temb_act)
+        hidden_states = m.x_embedders["image"](hidden_states)
+        image_rotary_emb = m.pos_embed(img_ids)
+
+        cond_temb_act = zero_temb_act.expand(batch_size, image_cond_hidden_states.shape[1], -1)
+        cond_early_mod = m.early_stream_modulations["image_cond"](cond_temb_act)
+        cond_single_mod = m.single_stream_modulations["image_cond"](cond_temb_act)
+        image_cond_hidden_states = m.x_embedders["image_cond"](image_cond_hidden_states)
+        cond_rotary_emb = m.pos_embed(image_cond_ids)
+
+        for block in m.txt_mode_blocks:
+            encoder_hidden_states = block(encoder_hidden_states, txt_early_mod, txt_rotary_emb)
+        for block in m.mode_blocks["image"]:
+            hidden_states = block(hidden_states, image_early_mod, image_rotary_emb)
+        for block in m.mode_blocks["image_cond"]:
+            image_cond_hidden_states = block(image_cond_hidden_states, cond_early_mod, cond_rotary_emb)
+
+        content_states = torch.cat([hidden_states, image_cond_hidden_states], dim=1)
+        content_mod = torch.cat([image_single_mod, cond_single_mod], dim=1)
+        joint_rotary_emb = (
+            torch.cat([txt_rotary_emb[0], image_rotary_emb[0], cond_rotary_emb[0]], dim=0),
+            torch.cat([txt_rotary_emb[1], image_rotary_emb[1], cond_rotary_emb[1]], dim=0),
+        )
+        for block in m.single_transformer_blocks:
+            encoder_hidden_states, content_states = block(
+                hidden_states=content_states,
+                encoder_hidden_states=encoder_hidden_states,
+                temb_mod=content_mod,
+                temb_mod_context=txt_single_mod,
+                image_rotary_emb=joint_rotary_emb,
+            )
+        hidden_states = content_states[:, :image_seq_len]
+        hidden_states = m.norm_out(hidden_states, image_temb)
+        return cast(torch.Tensor, m.proj_out(hidden_states))
+
+
+class Flux3TextEncoderWrapper(torch.nn.Module):
+    """Runs Qwen3-VL's language model up to the last stacked layer and stacks the hidden states.
+
+    The runtime passes 2-D `position_ids` (padding at position 1); the language model expands them
+    itself to four rows, one for the causal mask and three for its multimodal RoPE, exactly as the
+    full model does with given positions. Layers past the last one stacked never run, so they are
+    dropped, and so is the final norm, which in the full model only ever follows layer 36.
+    """
+
+    def __init__(self, text_encoder: torch.nn.Module, hidden_states_layers: tuple[int, ...] = TEXT_ENCODER_LAYERS) -> None:
+        super().__init__()
+        language_model = text_encoder.model.language_model
+        keep = max(hidden_states_layers)
+        language_model.layers = language_model.layers[:keep]
+        # The last hidden state a model returns is after its final norm. With the stack cut at
+        # the last stacked layer, that norm would land on it; in the full model it never does.
+        language_model.norm = torch.nn.Identity()
+        self.model = language_model
+        self.hidden_states_layers = hidden_states_layers
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        stacked = torch.stack([outputs.hidden_states[k] for k in self.hidden_states_layers], dim=1)
+        batch_size, num_layers, seq_len, hidden_dim = stacked.shape
+        return stacked.permute(0, 2, 1, 3).reshape(batch_size, seq_len, num_layers * hidden_dim)
+
+
+# ---------------------------------------------------------------------------
+# Position ids and dummy inputs
+# ---------------------------------------------------------------------------
+
+
+def image_position_ids(grid_h: int, grid_w: int, l_coord: float = 0.0) -> torch.Tensor:
+    """`[grid_h*grid_w, 4]` ids (t, h, w, l): h and w scaled by IMAGE_ROPE_SCALE, l constant
+    (0 for the generated image, -1, -2, … for references). Row-major over h then w."""
+    hh, ww = torch.meshgrid(torch.arange(grid_h, dtype=torch.float32), torch.arange(grid_w, dtype=torch.float32), indexing="ij")
+    ids = torch.zeros(grid_h * grid_w, 4)
+    ids[:, 1] = hh.reshape(-1) * IMAGE_ROPE_SCALE
+    ids[:, 2] = ww.reshape(-1) * IMAGE_ROPE_SCALE
+    ids[:, 3] = l_coord
+    return ids
+
+
+def text_position_ids(text_seq_len: int) -> torch.Tensor:
+    """`[text_seq_len, 4]` ids: the token index on the last axis."""
+    ids = torch.zeros(text_seq_len, 4)
+    ids[:, 3] = torch.arange(text_seq_len, dtype=torch.float32)
+    return ids
+
+
+def text_window(prompt_tokens: int) -> int:
+    """The text window for a prompt: its length rounded up to a multiple of 80, capped."""
+    windows = min(max(1, -(-prompt_tokens // TEXT_PAD_MULTIPLE)), MAX_TEXT_WINDOWS)
+    return windows * TEXT_PAD_MULTIPLE
+
+
+def dummy_flux3_transformer(pipe: Any, grid_h: int = 64, grid_w: int = 64, text_seq_len: int = 160) -> tuple[torch.Tensor, ...]:
+    cfg = pipe.transformer.config
+    dtype = next(pipe.transformer.parameters()).dtype
+    return (
+        torch.randn(1, grid_h * grid_w, cfg.in_channels, dtype=dtype),
+        torch.randn(1, text_seq_len, cfg.joint_attention_dim, dtype=dtype),
+        torch.tensor([0.5], dtype=dtype),
+        torch.tensor([0.4], dtype=dtype),
+        image_position_ids(grid_h, grid_w),
+        text_position_ids(text_seq_len),
+    )
+
+
+def flux3_transformer_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
+    """The text window is dynamic in steps of 80 (1 … MAX_TEXT_WINDOWS windows)."""
+    windows = torch.export.Dim("text_windows", min=1, max=MAX_TEXT_WINDOWS)
+    text_len = TEXT_PAD_MULTIPLE * windows
+    return (None, {1: text_len}, None, None, None, {0: text_len})
+
+
+def reference_position_ids(grids: list[tuple[int, int]]) -> torch.Tensor:
+    """`[sum(h*w), 4]` ids for references with these latent grids, in order: each its own grid
+    from (0, 0), told apart on the last axis (-1, -2, …), as diffusers packs them."""
+    return torch.cat([image_position_ids(h, w, l_coord=-(1 + index)) for index, (h, w) in enumerate(grids)], dim=0)
+
+
+def dummy_flux3_transformer_image_cond(
+    pipe: Any, grid_h: int = 64, grid_w: int = 64, cond_grids: tuple[tuple[int, int], ...] = ((64, 64),),
+    text_seq_len: int = 160,
+) -> tuple[torch.Tensor, ...]:
+    """Text-to-image inputs plus reference tokens filling `cond_grids` (one 64 × 64 grid: one
+    1024² reference, or the same 4096 tokens shared by several)."""
+    cfg = pipe.transformer.config
+    dtype = next(pipe.transformer.parameters()).dtype
+    cond_len = sum(h * w for h, w in cond_grids)
+    return dummy_flux3_transformer(pipe, grid_h, grid_w, text_seq_len) + (
+        torch.randn(1, cond_len, cfg.cond_in_channels, dtype=dtype),
+        reference_position_ids(list(cond_grids)),
+    )
+
+
+def flux3_transformer_image_cond_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
+    """The text window is dynamic as in text-to-image; the reference tokens are a fixed length."""
+    return flux3_transformer_dynamic_shapes() + (None, None)
+
+
+def dummy_flux3_text_encoder(pipe: Any, text_seq_len: int = 160) -> tuple[torch.Tensor, ...]:
+    ids = torch.zeros(1, text_seq_len, dtype=torch.int32)
+    mask = torch.ones(1, text_seq_len, dtype=torch.int32)
+    positions = torch.arange(text_seq_len, dtype=torch.int32).unsqueeze(0)
+    return (ids, mask, positions)
+
+
+def flux3_text_encoder_dynamic_shapes() -> tuple[dict[int, Any] | None, ...]:
+    windows = torch.export.Dim("text_windows", min=1, max=MAX_TEXT_WINDOWS)
+    text_len = TEXT_PAD_MULTIPLE * windows
+    return ({1: text_len}, {1: text_len}, {1: text_len})
+
+
+# ---------------------------------------------------------------------------
+# Loading: the large parts one at a time
+# ---------------------------------------------------------------------------
+
+
+class Flux3Parts:
+    """FLUX.3 [klein]'s parts for export, loaded only when a component's turn comes.
+
+    The transformer (11 GB at bfloat16) and the text encoder (8.9 GB) are never held at once:
+    `load_transformer()` and `load_text_encoder()` return fresh modules the export loop drops
+    after each asset. The VAE (0.3 GB), the tokenizer and the configs are kept.
+    """
+
+    def __init__(self, model_id: str, dtype: torch.dtype) -> None:
+        from diffusers import AutoencoderKLFlux2, Flux3Transformer2DModel
+        from transformers import AutoTokenizer
+
+        self.model_id = model_id
+        self.dtype = dtype
+        self.transformer_config = Flux3Transformer2DModel.load_config(model_id, subfolder="transformer")
+        self.vae = AutoencoderKLFlux2.from_pretrained(model_id, subfolder="vae", torch_dtype=dtype).eval()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_id, subfolder="text_encoder")
+
+    def load_transformer(self) -> torch.nn.Module:
+        from diffusers import Flux3Transformer2DModel
+
+        return Flux3Transformer2DModel.from_pretrained(self.model_id, subfolder="transformer", torch_dtype=self.dtype).eval()
+
+    def load_text_encoder(self) -> torch.nn.Module:
+        from transformers import Qwen3VLForConditionalGeneration
+
+        return Qwen3VLForConditionalGeneration.from_pretrained(self.model_id, subfolder="text_encoder", torch_dtype=self.dtype).eval()
+
+
+def dummy_flux3_transformer_export(pipe: Flux3Parts) -> tuple[torch.Tensor, ...]:
+    """Trace inputs from the config alone (no model load): 1024², two text windows
+    (torch.export fixes a dimension traced at size 1)."""
+    cfg, dtype = pipe.transformer_config, pipe.dtype
+    text_len = 2 * TEXT_PAD_MULTIPLE
+    return (
+        torch.randn(1, 64 * 64, cfg["in_channels"], dtype=dtype),
+        torch.randn(1, text_len, cfg["joint_attention_dim"], dtype=dtype),
+        torch.tensor([1.0], dtype=dtype),
+        torch.tensor([0.990472], dtype=dtype),
+        image_position_ids(64, 64),
+        text_position_ids(text_len),
+    )
+
+
+def dummy_flux3_text_encoder_export(pipe: Flux3Parts) -> tuple[torch.Tensor, ...]:
+    return dummy_flux3_text_encoder(pipe, text_seq_len=2 * TEXT_PAD_MULTIPLE)
+
+
+# ---------------------------------------------------------------------------
+# Bundle metadata and sidecars
+# ---------------------------------------------------------------------------
+
+
+def build_flux3_config(pipe: Flux3Parts) -> dict:
+    """The `diffusion` block of metadata.json the Swift pipeline reads."""
+    vae_config = pipe.vae.config
+    cfg = pipe.transformer_config
+    return {
+        "type": "flux3",
+        "prediction_type": "flow_matching",
+        "encoder_scale_factor": getattr(vae_config, "scaling_factor", 1.0),
+        "decoder_scale_factor": getattr(vae_config, "scaling_factor", 1.0),
+        "decoder_shift_factor": getattr(vae_config, "shift_factor", 0.0),
+        "batch_norm_eps": getattr(vae_config, "batch_norm_eps", 1e-4),
+        "guidance_embeds": False,
+        "image_size": 1024,
+        "default_guidance_scale": 1.0,
+        "default_steps": DEFAULT_STEPS,
+        "default_shift": TIMESTEP_SHIFT,
+        "rope_axes_dims": list(cfg.get("axes_dims_rope", [32, 32, 32, 32])),
+        "rope_theta": cfg.get("rope_theta", 10000),
+        "text_pad_multiple": TEXT_PAD_MULTIPLE,
+        "text_max_windows": MAX_TEXT_WINDOWS,
+        "image_rope_scale": IMAGE_ROPE_SCALE,
+        "text_encoder_layers": list(TEXT_ENCODER_LAYERS),
+    }
+
+
+def save_flux3_sidecars(pipe: Flux3Parts, output_path: Any, overwrite: bool) -> None:
+    """The tokenizer (with Qwen3-VL's chat template inlined, which swift-transformers reads
+    from tokenizer_config.json) and the VAE batch-norm statistics FLUX.2 also ships."""
+    import json
+    import shutil
+    from pathlib import Path
+
+    import numpy as np
+
+    output_path = Path(output_path)
+    tok_dir = output_path / "tokenizer"
+    if overwrite or not tok_dir.exists():
+        if tok_dir.exists():
+            shutil.rmtree(tok_dir)
+        pipe.tokenizer.save_pretrained(str(tok_dir))
+        config_file = tok_dir / "tokenizer_config.json"
+        config = json.loads(config_file.read_text())
+        if pipe.tokenizer.chat_template and not config.get("chat_template"):
+            config["chat_template"] = pipe.tokenizer.chat_template
+        if config.get("tokenizer_class") in ("Qwen2Tokenizer", "Qwen2TokenizerFast"):
+            config["tokenizer_class"] = "GPT2Tokenizer"
+        config_file.write_text(json.dumps(config, indent=2))
+        if not (tok_dir / "config.json").exists():
+            shutil.copy2(config_file, tok_dir / "config.json")
+    bn = pipe.vae.bn
+    np.save(output_path / "vae_bn_mean.npy", bn.running_mean.float().cpu().numpy())
+    np.save(output_path / "vae_bn_var.npy", bn.running_var.float().cpu().numpy())

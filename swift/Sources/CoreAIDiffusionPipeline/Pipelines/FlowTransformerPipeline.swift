@@ -28,6 +28,8 @@ public struct Img2ImgRoute: Sendable {
 ///
 /// - `.flux2` (FLUX.2 Klein): Qwen3 encoder, packed tokens with RoPE ids, BN + unpatchify.
 ///   See `FlowTransformerPipeline+Flux2.swift`.
+/// - `.flux3` (FLUX.3 Klein): Qwen3-VL encoder (80-token windows), flow-map Euler steps,
+///   FLUX.2's packing and VAE. See `FlowTransformerPipeline+Flux3.swift`.
 /// - `.sanaSprint`: Gemma2 encoder, NCHW latents, SCM schedule with stochastic steps.
 ///   See `FlowTransformerPipeline+SanaSprint.swift`.
 public struct FlowTransformerPipeline: DiffusionPipeline {
@@ -57,12 +59,19 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
     public let batchNormVar: [Float]?
     public let batchNormEps: Float
 
-    /// Image size is determined by the mode selected at init.
+    /// Image size is determined by the mode selected at init, or by a non-square
+    /// export's `image_width` × `image_height`.
     public var defaultImageSize: (width: Int, height: Int) {
+        if let width = config.imageWidth, let height = config.imageHeight {
+            return mode == .half ? (width / 2, height / 2) : (width, height)
+        }
         let full = config.imageSize ?? DiffusionDefaults.Image.imageSize
         let size = (mode == .half) ? full / 2 : full
         return (size, size)
     }
+
+    /// Whether this export's image is non-square — text-to-image only.
+    public var isNonSquare: Bool { defaultImageSize.width != defaultImageSize.height }
 
     public var supportedSchedulers: [SchedulerType] {
         [.discreteFlow]
@@ -153,14 +162,18 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
         configuration: PipelineConfiguration,
         progressHandler: ((PipelineProgress) -> Bool)?
     ) async throws -> GenerationResult {
-        var plan =
-            config.type == .sanaSprint
-            ? try await makeSanaSprintPlan(configuration)
-            : try await makeFlux2Plan(configuration)
+        var plan: DenoisingPlan
+        switch config.type {
+        case .sanaSprint: plan = try await makeSanaSprintPlan(configuration)
+        case .flux3: plan = try await makeFlux3Plan(configuration)
+        default: plan = try await makeFlux2Plan(configuration)
+        }
         let scheduler = plan.scheduler
         let steps = scheduler.inferenceStepCount
+        // Strength img2img enters the schedule part-way; progress counts the steps that run.
+        let begin = scheduler.beginIndex
 
-        for step in 0..<steps {
+        for step in begin..<steps {
             // Capture the denoising state BEFORE the scheduler advances so the
             // preview below can form the x0 estimate.
             let sigma = scheduler.currentSigma
@@ -196,7 +209,8 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
                 previewLatents.mutableView(as: Float.self).withUnsafeMutablePointer { ptr, _, _ in
                     for i in 0..<vae.count { ptr[i] = vae[i] }
                 }
-                let progress = PipelineProgress(step: step + 1, totalSteps: steps, currentLatent: previewLatents)
+                let progress = PipelineProgress(
+                    step: step - begin + 1, totalSteps: steps - begin, currentLatent: previewLatents)
                 if !progressHandler(progress) { break }
             }
         }
@@ -216,7 +230,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
         switch mode {
         case .full, .half:
-            pixels = try await decoder.run(floatInputs: [(vaeLatents, vaeShape)])
+            // Whole up to 4 megapixels; past that (FLUX.3 draws up to 4096 a side) in tiles.
+            pixels = try await decodeLarge(
+                latents: vaeLatents, channels: vaeShape[1], height: vaeShape[2], width: vaeShape[3],
+                scale: (configuration.imageHeight ?? defaultImageSize.height) / vaeShape[2], decoder: decoder)
 
         case .tiled:
             pixels = try await decodeTiled(
@@ -229,7 +246,10 @@ public struct FlowTransformerPipeline: DiffusionPipeline {
 
         if configuration.lazyModelLoading { await decoder.unloadResources() }
 
-        let image = try DiffusionUtilities.pixelsToCGImage(pixels, height: imageSize, width: imageSize)
+        // The run's own size when it asked for one (FLUX.3 draws any), else the export's.
+        let image = try DiffusionUtilities.pixelsToCGImage(
+            pixels, height: configuration.imageHeight ?? defaultImageSize.height,
+            width: configuration.imageWidth ?? defaultImageSize.width)
 
         var latentsND = NDArray(shape: plan.noiseShape, scalarType: .float32)
         let latentsView = latentsND.mutableView(as: Float.self)

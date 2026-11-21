@@ -64,8 +64,12 @@ flags are irrelevant and will produce a warning if passed without `--single-func
 ### Image-to-image
 
 Needs a VAE encoder plus an img2img transformer. Reference tokens from your input image
-are concatenated onto the noise sequence, so adherence comes from `--reference-grid`,
-not from noise blending (`--strength` is ignored).
+are concatenated onto the noise sequence, so at `--strength 1` adherence comes from
+`--reference-grid` alone. (arraypress fork, `1.0.0-nonsquare.4`:) below 1 the latents also start
+from the input image blended with noise, entering a re-spaced schedule of `steps / strength` steps
+at `total − steps`, so the caller's step count still runs and every strength is reachable. Measured
+on FLUX.2 Klein 4B at 4 steps, SSIM to the source: 0.99 at 0.2, 0.84–0.99 at 0.6, 0.64–0.67 at 0.8,
+0.49–0.56 at 1.0. Strength 1 is byte-identical to the unmodified pipeline.
 
 The default already includes every grid. `--single-function` needs one chosen at export:
 
@@ -114,6 +118,30 @@ output grid. At 1024x1024 decode resolution, that ends up being 4096 / 1024 / 25
 Fewer tokens is faster and lighter, but with coarser guidance. The `transformer*_img2img_*`
 assets exist only for single-function exports, whereas multi-function carries these as named
 entrypoints inside `Transformer.aimodel`.
+
+## LoRAs without re-exporting: `--lora-slot` (fork addition)
+
+Core AI has no adapter API, so a LoRA merged into the weights costs a whole transformer
+export per LoRA. `--lora-slot RANK` exports the text-to-image transformer once with every
+LoRA-targeted Linear layer computing `W·x + B·(A·x)`, A (`[rank, in]`) and B
+(`[out, rank]`) arriving as inputs `lora_a_<i>` / `lora_b_<i>`:
+
+```shell
+uv run coreai.diffusion.export flux2-klein-4b --lora-slot 16 --output-dir exports/klein-slot
+```
+
+It writes `Transformer.aimodel` (same size as the plain one, uncompressed) and `slot.json`,
+the rank and each layer's name and shape in input order. The layers are the attention
+projections of the double-stream blocks and the fused projections of the single-stream
+blocks — 80 on Klein 4B (`lora_slot.TARGETS`). Text encoder, VAEs and tokenizer are the plain
+export's. In Swift, pass the matrices as `PipelineConfiguration.transformerInputs`
+(names from `LoRASlot`); any slot input left out is zeros. A LoRA of lower rank is
+zero-padded; its alpha/rank scale belongs folded into B.
+
+Measured, Klein 4B rank 16 at 1024² on an M3 Max: 166 inputs, exported in 102 s at 16.9 GB
+peak RAM; zero matrices give output bit-identical to the plain export; a LoRA through the
+slot vs merged in PyTorch fp16, relative L2 0.0024 (the plain export's own error vs PyTorch
+is 0.0039); about 2 % slower per step. Text-to-image at the exported size only.
 
 ## Running
 

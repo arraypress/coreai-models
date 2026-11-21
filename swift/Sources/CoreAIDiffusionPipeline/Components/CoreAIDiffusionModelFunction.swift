@@ -16,6 +16,8 @@ public actor CoreAIDiffusionModelFunction {
     /// Cached InferenceFunctions keyed by name. Reusing loaded functions (rather
     /// than reloading per call) avoids a GPU memory leak — see PR #110.
     private var functionCache: [String: InferenceFunction] = [:]
+    /// Zero arrays for slot inputs a run leaves out, keyed "function/input".
+    private var zeroSlotInputs: [String: NDArray] = [:]
     private var isLoaded = false
 
     public init(modelURL: URL) {
@@ -44,6 +46,7 @@ public actor CoreAIDiffusionModelFunction {
 
     public func unloadResources() {
         functionCache.removeAll()
+        zeroSlotInputs.removeAll()
         model = nil
         isLoaded = false
     }
@@ -112,16 +115,39 @@ public actor CoreAIDiffusionModelFunction {
     }
 
     public func run(
-        floatInputs: [([Float], [Int])], functionName: String = "main"
+        floatInputs: [([Float], [Int])], functionName: String = "main",
+        namedInputs extra: [String: NDArray] = [:]
     ) async throws -> [Float] {
-        try await run(inputs: floatInputs.map { .floats($0.0, $0.1) }, functionName: functionName)
+        try await run(
+            inputs: floatInputs.map { .floats($0.0, $0.1) }, functionName: functionName,
+            namedInputs: extra)
     }
 
-    public func run(inputs: [ModelInput], functionName: String = "main") async throws -> [Float] {
+    /// Runs one function.
+    ///
+    /// - Parameters:
+    ///   - inputs: The positional inputs, in the function's declared input order.
+    ///   - namedInputs: Further inputs by name, after the positional ones — e.g. the LoRA
+    ///     matrices of a transformer exported with `--lora-slot`. Names the function does
+    ///     not declare are ignored, so the same dictionary can follow a pipeline into
+    ///     functions that take none. Slot inputs (`lora_a_<i>`, `lora_b_<i>`) the function
+    ///     declares but the caller leaves out are zeros, so a slot export run without a
+    ///     LoRA computes exactly what the plain export does.
+    public func run(
+        inputs: [ModelInput], functionName: String = "main",
+        namedInputs extra: [String: NDArray] = [:]
+    ) async throws -> [Float] {
         let fn = try await function(named: functionName)
+        let declared = fn.descriptor.inputNames
 
         var namedInputs: [String: NDArray] = [:]
-        for (i, name) in fn.descriptor.inputNames.enumerated() where i < inputs.count {
+        for (name, array) in extra where declared.contains(name) {
+            namedInputs[name] = array
+        }
+        for name in LoRASlot.missingInputs(declared: declared, provided: Set(namedInputs.keys)) {
+            namedInputs[name] = try zeroSlotInput(named: name, in: fn, functionName: functionName)
+        }
+        for (i, name) in declared.enumerated() where i < inputs.count {
             switch inputs[i] {
             case .cached(let array):
                 namedInputs[name] = array
@@ -231,6 +257,26 @@ public actor CoreAIDiffusionModelFunction {
             throw CoreAIDiffusionError.functionNotFound(name, modelURL)
         }
         return fn
+    }
+
+    /// An all-zero array for a slot input the caller left out, built once per function
+    /// and input: 160 of them come to 37 MB at rank 16, too much to rebuild every step.
+    private func zeroSlotInput(
+        named name: String, in fn: InferenceFunction, functionName: String
+    ) throws -> NDArray {
+        let key = "\(functionName)/\(name)"
+        if let cached = zeroSlotInputs[key] { return cached }
+        guard case .ndArray(let nd) = fn.descriptor.inputDescriptor(of: name),
+            nd.shape.allSatisfy({ $0 > 0 })
+        else {
+            throw CoreAIDiffusionError.functionNotFound(name, modelURL)
+        }
+        var array = NDArray(descriptor: nd)
+        Self.packFloatsIntoNDArray(
+            &array, data: [Float](repeating: 0, count: nd.shape.reduce(1, *)),
+            scalarType: nd.scalarType)
+        zeroSlotInputs[key] = array
+        return array
     }
 
     /// Like `function(named:)` but returns nil (instead of throwing) when the

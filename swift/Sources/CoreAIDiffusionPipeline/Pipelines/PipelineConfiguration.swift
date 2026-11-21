@@ -69,6 +69,16 @@ public struct PipelineConfiguration: Hashable, Sendable {
     public var strength: Float
     public var referenceGrid: ReferenceGrid
     public var guidanceMode: GuidanceMode
+    /// Further reference images after `startingImage` (FLUX.2 only). With more than one
+    /// reference in all, each is area-averaged to a quarter of the tokens and the four
+    /// quarters of the traced full-grid route are dealt to them in turn, each reference
+    /// on its own T offset (10, 20, …) as diffusers does. Up to four references in all.
+    public var additionalReferences: [CGImage]
+
+    /// Extra named inputs for the text-to-image transformer — the LoRA matrices of an
+    /// export made with `--lora-slot` (see ``LoRASlot``). Ignored by functions that do not
+    /// declare them; slot inputs left out are zeros.
+    public var transformerInputs: [String: NDArray]
 
     // VAE scale factors (from the metadata.json diffusion block)
     public var encoderScaleFactor: Float
@@ -81,6 +91,10 @@ public struct PipelineConfiguration: Hashable, Sendable {
     /// Load model components on demand and unload after each pipeline stage to reduce peak memory.
     /// Disable to keep all models resident and exercise full memory pressure (e.g. profiling peak footprint).
     public var lazyModelLoading: Bool
+    /// The picture's width and height, for an export whose image length is variable
+    /// (FLUX.3); nil takes the export's own size.
+    public var imageWidth: Int?
+    public var imageHeight: Int?
 
     public init(
         prompt: String,
@@ -97,7 +111,11 @@ public struct PipelineConfiguration: Hashable, Sendable {
         decoderScaleFactor: Float = 0.18215,
         decoderShiftFactor: Float = 0.0,
         decodeResolution: DecodeResolution = .full,
-        lazyModelLoading: Bool = true
+        lazyModelLoading: Bool = true,
+        additionalReferences: [CGImage] = [],
+        transformerInputs: [String: NDArray] = [:],
+        imageWidth: Int? = nil,
+        imageHeight: Int? = nil
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -114,9 +132,16 @@ public struct PipelineConfiguration: Hashable, Sendable {
         self.decoderShiftFactor = decoderShiftFactor
         self.decodeResolution = decodeResolution
         self.lazyModelLoading = lazyModelLoading
+        self.additionalReferences = additionalReferences
+        self.imageWidth = imageWidth
+        self.imageHeight = imageHeight
+        self.transformerInputs = transformerInputs
     }
 
-    public var isImageToImage: Bool { startingImage != nil }
+    public var isImageToImage: Bool { startingImage != nil || !additionalReferences.isEmpty }
+
+    /// Every reference image, the starting image first.
+    public var referenceImages: [CGImage] { (startingImage.map { [$0] } ?? []) + additionalReferences }
 }
 
 /// Hashable conformance — CGImage excluded (not Hashable).
@@ -136,6 +161,10 @@ extension PipelineConfiguration {
         hasher.combine(decoderShiftFactor)
         hasher.combine(decodeResolution)
         hasher.combine(lazyModelLoading)
+        hasher.combine(additionalReferences.count)
+        hasher.combine(transformerInputs.keys.sorted())
+        hasher.combine(imageWidth)
+        hasher.combine(imageHeight)
     }
 
     public static func == (lhs: Self, rhs: Self) -> Bool {
@@ -153,5 +182,9 @@ extension PipelineConfiguration {
             && lhs.decoderShiftFactor == rhs.decoderShiftFactor
             && lhs.decodeResolution == rhs.decodeResolution
             && lhs.lazyModelLoading == rhs.lazyModelLoading
+            && lhs.additionalReferences.count == rhs.additionalReferences.count
+            && lhs.transformerInputs.keys.sorted() == rhs.transformerInputs.keys.sorted()
+            && lhs.imageWidth == rhs.imageWidth
+            && lhs.imageHeight == rhs.imageHeight
     }
 }
